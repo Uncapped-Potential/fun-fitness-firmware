@@ -78,7 +78,7 @@ Install via **Tools > Manage Libraries**:
 
 ## Configuration
 
-- **Data rate**: 50Hz (adjustable in code)
+- **Data rate**: 24Hz (adjustable in code)
 - **BLE Service UUID**: `12345678-1234-1234-1234-123456789012`
 - **BLE Characteristic UUID**: `dcba4330-dcba-4321-dcba-432123456791`
 
