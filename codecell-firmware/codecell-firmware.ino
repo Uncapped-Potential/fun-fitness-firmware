@@ -24,8 +24,6 @@ bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
 int dataRate = 50; // 50Hz default
-int currentBatteryLevel = -1; // Cache battery level
-unsigned long lastBatteryRead = 0;
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -89,9 +87,7 @@ void setup() {
     // Set LED brightness to medium level
     myCodeCell.LED_SetBrightness(7);
 
-    // Read initial battery level
-    currentBatteryLevel = myCodeCell.BatteryLevelRead();
-    lastBatteryRead = millis();
+    // Battery will be read fresh every cycle at 50Hz
 
     // Initialize BLE
     BLEDevice::init("CodeCell");
@@ -127,17 +123,6 @@ void setup() {
 }
 
 void loop() {
-    unsigned long currentTime = millis();
-
-    // Read battery every 30 seconds (30000ms)
-    if (currentTime - lastBatteryRead >= 30000) {
-        currentBatteryLevel = myCodeCell.BatteryLevelRead();
-        lastBatteryRead = currentTime;
-        Serial.print("Battery updated: ");
-        Serial.print(currentBatteryLevel);
-        Serial.println("%");
-    }
-
     if (myCodeCell.Run(dataRate)) {
         // Read all sensor data
         float roll, pitch, yaw;
@@ -148,20 +133,23 @@ void loop() {
         myCodeCell.Motion_AccelerometerRead(ax, ay, az);
         myCodeCell.Motion_GyroRead(gx, gy, gz);
 
-        // Send clean formatted data for computer GUI with cached battery level
+        // Read battery fresh every cycle (50Hz) - minimal power impact
+        int batteryLevel = myCodeCell.BatteryLevelRead();
+
+        // Send clean formatted data for computer GUI with fresh battery level
         char message[120];
         sprintf(message, "R:%.3f,P:%.3f,Y:%.3f,AX:%.3f,AY:%.3f,AZ:%.3f,GX:%.3f,GY:%.3f,GZ:%.3f,B:%d",
-                roll, pitch, yaw, ax, ay, az, gx, gy, gz, currentBatteryLevel);
+                roll, pitch, yaw, ax, ay, az, gx, gy, gz, batteryLevel);
 
         // Send via BLE if connected
         if (deviceConnected) {
             pCharacteristic->setValue(message);
             pCharacteristic->notify();
         }
-    }
 
-    // Always update LED with cached battery level
-    updateBatteryLED(currentBatteryLevel);
+        // Update LED based on current battery status
+        updateBatteryLED(batteryLevel);
+    }
 
     // Handle disconnection and restart advertising
     if (!deviceConnected && oldDeviceConnected) {
