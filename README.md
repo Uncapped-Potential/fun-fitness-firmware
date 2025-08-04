@@ -75,11 +75,29 @@ ESP32 firmware for the Fun Fitness wireless game controller with motion tracking
    - Use: Mounting controller to surfaces
    - Quantity needed: As required
 
+### 3D Printed Enclosure
+
+8. **Enclosure Components** (see `/enclosure` directory)
+   - **Files**: Up V7 Body, Up V7 lid, Up V7 switch cradle
+   - **Material**: **FIRE RETARDANT (PC-FR) REQUIRED** for production use
+   - **Quantity**: 1 of each component
+   - **Note**: Standard materials acceptable for internal testing only
+
+### Safety Equipment
+
+9. **LiPo Safety Bag**
+   - Product: [PAWBOSE Fireproof LiPo Battery Bag](https://www.amazon.com/PAWBOSE-Fireproof-185x75x60mm-Explosionproof-Protection/dp/B0F6LP63HD/)
+   - Specifications: 185x75x60mm fireproof/explosionproof case
+   - Use: Safe storage and charging of controller
+   - **HIGHLY RECOMMENDED** for any LiPo battery use
+
 ### Assembly Notes
 
 - The CodeCell comes with 4x M1.2 self-tapping screws for direct mounting
 - JST connectors are for connecting the power switch inline with the battery
 - M1.2 nuts and bolts provide additional mounting options
+- **SAFETY**: Always use fire retardant materials for enclosure in production
+- **SAFETY**: Store and charge controller in LiPo safety bag
 - Total assembled weight: ~8g (3.4g board + 4.6g battery)
 
 ## Data Protocol
