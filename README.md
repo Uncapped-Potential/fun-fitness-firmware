@@ -212,7 +212,6 @@ Install via **Tools > Manage Libraries**:
 
 ## Configuration
 
-# feature/sleep-mode
 - **Data rate**: 24Hz (optimized from 50Hz for battery life)
 - **Protocol**: Binary by default (19 bytes per packet)
 - **BLE Service UUID**: `12345678-1234-1234-1234-123456789012`
