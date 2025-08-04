@@ -100,6 +100,35 @@ ESP32 firmware for the Fun Fitness wireless game controller with motion tracking
 - **SAFETY**: Store and charge controller in LiPo safety bag
 - Total assembled weight: ~8g (3.4g board + 4.6g battery)
 
+## Quick Order BOM
+
+For easy procurement, here's a table with links and quantities needed for **one FitChip assembly**:
+
+| Component | Link | Qty |
+|-----------|------|-----|
+| CodeCell Light+Motion (170mAh) | [Microbots](https://microbots.io/products/codecell) | 1 |
+| SPDT Slide Switch | [Amazon B0DN69PJ43](https://www.amazon.com/dp/B0DN69PJ43) | 1 |
+| JST 1.25mm Male/Female Cables | [Amazon B013JRWCBU](https://www.amazon.com/dp/B013JRWCBU) | 1 pair |
+| M1.2 Screw/Nut Set | [Amazon B0DBHNJLTD](https://www.amazon.com/dp/B0DBHNJLTD) | 1 set |
+| Laptop Screws (M1.2) | [Amazon B0D8PMBPB7](https://www.amazon.com/dp/B0D8PMBPB7) | 1 set |
+| USB-C Cable | [Amazon B0CGNK4LTT](https://www.amazon.com/dp/B0CGNK4LTT) | 1 |
+| Adhesive Velcro | [Amazon B0B3SR5M71](https://www.amazon.com/dp/B0B3SR5M71) | As needed |
+| **Safety Equipment** | | |
+| LiPo Safety Bag | [Amazon B0F6LP63HD](https://www.amazon.com/PAWBOSE-Fireproof-185x75x60mm-Explosionproof-Protection/dp/B0F6LP63HD/) | 1 |
+
+## Required Tools & Materials
+
+| Tool/Material | Purpose | Source |
+|---------------|---------|---------|
+| **3D Printer** | Print enclosure components | Required |
+| **Fire Retardant Filament (PC-FR)** | Enclosure printing | [Bambu Lab PC-FR](https://us.store.bambulab.com/products/pc-fr) |
+| **Soldering Iron** | Wire connections | Required |
+| **Heat Gun** | Heat shrink application | Required |
+| **Heat Shrink Tubing** | Wire insulation | Required |
+| **Tweezers** | Component handling | Required |
+
+**3D Print Files:** See `/enclosure` directory - **fire retardant material required for production**
+
 ## Data Protocol
 
 The firmware supports two streaming formats for backward compatibility:
