@@ -18,6 +18,70 @@ ESP32 firmware for the Fun Fitness wireless game controller with motion tracking
 - **Communication**: Bluetooth Low Energy (BLE)
 - **Power**: Battery with USB charging
 
+## Bill of Materials (BOM)
+
+### Core Components
+
+1. **CodeCell Light + Motion (170mAh battery)**
+   - Product: [CodeCell from Microbots.io](https://microbots.io/products/codecell)
+   - Variant: Light + Motion / 170mAh 20C LiPo / Unsoldered
+   - Specifications:
+     - ESP32-C3 32-bit RISC-V (160 MHz)
+     - BNO085 9-axis IMU (accelerometer, gyroscope, magnetometer)
+     - VCNL4040 light/proximity sensor
+     - 170mAh LiPo battery included
+     - Dimensions: 18.5 x 18.5 x 9.4 mm
+   - Included: 4x M1.2 self-tapping screws (~5mm) for mounting
+
+2. **Power Switch**
+   - Product: [SPDT Mini Slide Switch](https://www.amazon.com/dp/B0DN69PJ43)
+   - Specifications:
+     - Model: SS12D00G
+     - Size: 8.7 x 3.7 x 11.7mm (L x W x H)
+     - Pin Pitch: 0.1" / 2.54mm
+     - Type: SPDT on-off, 3 pins
+     - Mounting: Vertical through-hole, panel mount
+     - Sliding knob length: 3mm
+   - Quantity needed: 1
+
+### Connectors and Cables
+
+3. **JST 1.25mm Connectors**
+   - Product: [JST 1.25mm 2-Pin Male/Female Cables](https://www.amazon.com/dp/B013JRWCBU)
+   - Use: Battery connection
+   - Quantity needed: 1 male-female pair
+
+4. **USB-C Cable**
+   - Product: [USB-C to USB-C Cable](https://www.amazon.com/dp/B0CGNK4LTT) (or any USB-C cable)
+   - Use: Programming and charging
+   - Quantity needed: 1
+
+### Mounting Hardware
+
+5. **M1.2 Nuts**
+   - Product: [Stainless Steel Screw Set](https://www.amazon.com/dp/B0DBHNJLTD)
+   - Specifications: M1.2 x 0.25 pitch
+   - Quantity needed: 2
+
+6. **M1.2 Bolts**
+   - Product: [Laptop Screw Set](https://www.amazon.com/dp/B0D8PMBPB7)
+   - Specifications:
+     - 4x M1.2 x 5mm bolts
+     - 2x M1.2 x 6mm bolts
+   - Quantity needed: 6 total
+
+7. **Mounting Adhesive**
+   - Product: [Command Strips Velcro](https://www.amazon.com/dp/B0B3SR5M71) or any adhesive velcro
+   - Use: Mounting controller to surfaces
+   - Quantity needed: As required
+
+### Assembly Notes
+
+- The CodeCell comes with 4x M1.2 self-tapping screws for direct mounting
+- JST connectors are for connecting the power switch inline with the battery
+- M1.2 nuts and bolts provide additional mounting options
+- Total assembled weight: ~8g (3.4g board + 4.6g battery)
+
 ## Data Protocol
 
 The firmware supports two streaming formats for backward compatibility:
