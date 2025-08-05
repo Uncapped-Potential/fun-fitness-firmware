@@ -202,7 +202,8 @@ R:45.123,P:-12.456,Y:180.789,AX:0.123,AY:-0.456,AZ:9.789,GX:1.234,GY:-2.345,GZ:0
 
 Install via **Tools > Manage Libraries**:
 - **CodeCell** - For CodeCell hardware support
-- **ESP32** by Espressif - Core ESP32 support (BLE is included)
+
+**Note**: ESP32 core support is installed via Boards Manager (see Board Configuration above), not Library Manager. BLE support is included with the ESP32 core.
 
 ### Upload
 
