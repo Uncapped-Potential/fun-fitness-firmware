@@ -42,7 +42,7 @@
       myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER);
 
       // Initialize BLE
-      BLEDevice::init("CodeCell");
+      BLEDevice::init("FitChip");
       pServer = BLEDevice::createServer();
       pServer->setCallbacks(new MyServerCallbacks());
 
