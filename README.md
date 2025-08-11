@@ -190,7 +190,11 @@ R:45.123,P:-12.456,Y:180.789,AX:0.123,AY:-0.456,AZ:9.789,GX:1.234,GY:-2.345,GZ:0
    git clone https://github.com/Uncapped-Potential/fun-fitness-firmware.git
    cd fun-fitness-firmware
    ```
-3. Open `codecell-firmware/codecell-firmware.ino` in Arduino IDE
+3. Open `codecell-firmware/codecell-firmware.ino` in Arduino IDE (must have nested folder and file with same name, quirk of arduino)
+
+### Guide
+
+[Video](https://drive.google.com/file/d/13qVB6rGZdJrtGnBQS_VcSYYFrTN_345D/view?usp=vids_web) 
 
 ### Board Configuration
 
