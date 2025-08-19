@@ -242,6 +242,17 @@ No firmware changes needed - the web app handles both formats seamlessly.
 - **macOS permissions**: May need to allow Arduino IDE in Security & Privacy settings
 - **High g-force readings**: Binary protocol supports up to ±65.5g for vigorous gaming
 - **Battery drain**: Reduced polling to 24Hz and binary protocol optimize battery life
+- **Device name shows old name in Chrome**: Chrome Web Bluetooth caches device names persistently. After updating firmware device name, Chrome may still show the old name. Solutions:
+  - Use a different browser (Safari, Firefox) 
+  - Restart Chrome completely
+  - Use Chrome Incognito mode
+  - Connect with a different device/computer
+  - Note: This is a browser caching issue, not a firmware problem
+- **Upload errors "chip stopped responding"**: If you get upload failures after potential pin shorting:
+  1. Try uploading again (may work on retry)
+  2. If persistent, erase flash: `esptool --port /dev/cu.usbmodem1101 erase_flash`
+  3. Then upload firmware normally through Arduino IDE
+  4. Device should recover and show "New connection established" in serial monitor
 
 ## Known Issues
 
