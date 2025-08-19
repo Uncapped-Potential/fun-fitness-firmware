@@ -58,17 +58,22 @@ ESP32 firmware for the Fun Fitness wireless game controller with motion tracking
 
 ### Mounting Hardware
 
-5. **M1.2 Nuts**
-   - Product: [Stainless Steel Screw Set](https://www.amazon.com/dp/B0DBHNJLTD)
-   - Specifications: M1.2 x 0.25 pitch
-   - Quantity needed: 2
-
-6. **M1.2 Bolts**
+5. **M1.2 x 0.25mm Screws** (Current Option)
    - Product: [Laptop Screw Set](https://www.amazon.com/dp/B0D8PMBPB7)
-   - Specifications:
-     - 4x M1.2 x 5mm bolts
-     - 2x M1.2 x 6mm bolts
-   - Quantity needed: 6 total
+   - Specifications: M1.2 x 0.25mm thread pitch, 4-6mm length
+   - Quantity needed: 2 screws (from set)
+   - Note: Currently tested and supported
+
+6. **M1.2 x 0.25mm Nuts** (Current Option)
+   - Product: [Stainless Steel Screw Set](https://www.amazon.com/dp/B0DBHNJLTD)
+   - Specifications: M1.2 x 0.25mm thread pitch
+   - Quantity needed: 2 nuts (from set)
+   - Note: Must be press-fit into enclosure holes
+
+**Alternative Hardware (Future - Testing in Progress):**
+- **Screws**: [M1.2 x 5mm Individual Screws](https://www.amazon.com/dp/B0C1S9GHVB) - Specific size option
+- **Nuts**: [M1.2 Hex Nuts](https://www.amazon.com/dp/B01N8UF3HU) - Individual nuts
+- Note: These alternatives are being tested but not yet fully validated
 
 7. **Mounting Adhesive**
    - Product: [Command Strips Velcro](https://www.amazon.com/dp/B0B3SR5M71) or any adhesive velcro
@@ -77,11 +82,24 @@ ESP32 firmware for the Fun Fitness wireless game controller with motion tracking
 
 ### 3D Printed Enclosure
 
-8. **Enclosure Components** (see `/enclosure` directory)
-   - **Files**: Up V7 Body, Up V7 lid, Up V7 switch cradle
+8. **Enclosure Components** (see `/enclosure_3D_models` directory)
+   - **Files**: 
+     - Up_FF_Body_V9_Rev_4.3mf (Body)
+     - UP_FF_Lid_V9_Rev_4.3mf (Lid)
    - **Material**: **FIRE RETARDANT (PC-FR) REQUIRED** for production use
    - **Quantity**: 1 of each component
+   - **Format**: 3MF files provided, Bambu print profile available (may need adjustment for Prusa A1)
    - **Note**: Standard materials acceptable for internal testing only
+
+#### Print Settings
+   - **Layer Height**: 0.12mm
+   - **Infill**: 15%
+   - **Wall Loops**: 2
+   - **Supports**: Minimal - CRITICAL: Only add supports to outer perimeter of holes
+   - **Orientation**: See photos in `/enclosure_3D_models/print orientation photos and settings/`
+   - **Important**: Do NOT add supports inside tight holes as they will be impossible to remove
+   - Refer to photos for detailed print settings and support placement
+   - Contact Cooper if you have any questions or problems
 
 ### Safety Equipment
 
@@ -91,13 +109,47 @@ ESP32 firmware for the Fun Fitness wireless game controller with motion tracking
    - Use: Safe storage and charging of controller
    - **HIGHLY RECOMMENDED** for any LiPo battery use
 
-### Assembly Notes
+### Assembly Instructions
 
-- The CodeCell comes with 4x M1.2 self-tapping screws for direct mounting
-- JST connectors are for connecting the power switch inline with the battery
-- M1.2 nuts and bolts provide additional mounting options
-- **SAFETY**: Always use fire retardant materials for enclosure in production
-- **SAFETY**: Store and charge controller in LiPo safety bag
+1. **Prepare the Enclosure**
+   - Press-fit the two M1.2 x 0.25mm nuts into the designated holes in the body
+   - Ensure nuts are seated properly for threading
+
+2. **Install CodeCell**
+   - Insert the CodeCell into the body
+   - Secure with the 4x M1.2 self-tapping screws that come with the CodeCell
+
+3. **Assemble Switch Harness**
+   - Connect the power switch inline with battery using JST connectors
+   - (Additional switch harness specifications to be added)
+
+4. **Install Battery**
+   - Cut a small piece of adhesive velcro
+   - Apply velcro to designated area in enclosure (see photos)
+   - Apply matching velcro to battery
+   - Press battery firmly into place
+   - Ensure secure attachment with reasonable amount of velcro
+
+5. **Cable Management**
+   - Route JST connectors and cables through cable routing clips
+   - Ensure all connections are secure
+   - Verify nothing interferes with lid closure
+
+6. **Final Assembly**
+   - Perform shake test - everything should be secure
+   - Align lid with body
+   - Insert M1.2 x 0.25mm screws (4-6mm length) through lid into press-fit nuts
+   - Tighten screws carefully - do not overtighten
+
+### Safety Notes
+
+- **Battery Inspection**: CRITICAL - Thoroughly inspect battery for any damage before installation
+- **Lid Closure**: Ensure nothing is pressing on the battery when closing lid (risk of damage)
+- **Velcro Attachment**: Battery must be properly secured with adequate velcro to prevent movement
+- **Quality Control**: Additional QC specifications forthcoming
+- **Fire Safety**: Always use fire retardant materials for enclosure in production
+- **Storage**: Store and charge controller in LiPo safety bag
+- **Handling**: Use proper ESD precautions when handling electronics
 - Total assembled weight: ~8g (3.4g board + 4.6g battery)
 
 ## Quick Order BOM
@@ -109,8 +161,8 @@ For easy procurement, here's a table with links and quantities needed for **one 
 | CodeCell Light+Motion (170mAh) | [Microbots](https://microbots.io/products/codecell) | 1 |
 | SPDT Slide Switch | [Amazon B0DN69PJ43](https://www.amazon.com/dp/B0DN69PJ43) | 1 |
 | JST 1.25mm Male/Female Cables | [Amazon B013JRWCBU](https://www.amazon.com/dp/B013JRWCBU) | 1 pair |
-| M1.2 Screw/Nut Set | [Amazon B0DBHNJLTD](https://www.amazon.com/dp/B0DBHNJLTD) | 1 set |
-| Laptop Screws (M1.2) | [Amazon B0D8PMBPB7](https://www.amazon.com/dp/B0D8PMBPB7) | 1 set |
+| M1.2 x 0.25mm Screws (4-6mm) | [Amazon B0D8PMBPB7](https://www.amazon.com/dp/B0D8PMBPB7) | 2 from set |
+| M1.2 x 0.25mm Nuts | [Amazon B0DBHNJLTD](https://www.amazon.com/dp/B0DBHNJLTD) | 2 from set |
 | USB-C Cable | [Amazon B0CGNK4LTT](https://www.amazon.com/dp/B0CGNK4LTT) | 1 |
 | Adhesive Velcro | [Amazon B0B3SR5M71](https://www.amazon.com/dp/B0B3SR5M71) | As needed |
 | **Safety Equipment** | | |
@@ -127,7 +179,8 @@ For easy procurement, here's a table with links and quantities needed for **one 
 | **Heat Shrink Tubing** | Wire insulation | Required |
 | **Tweezers** | Component handling | Required |
 
-**3D Print Files:** See `/enclosure` directory - **fire retardant material required for production**
+**3D Print Files:** See `/enclosure_3D_models` directory - **fire retardant material required for production**
+**Print Settings Photos:** See `/enclosure_3D_models/print orientation photos and settings/` for detailed guidance
 
 ## Data Protocol
 
