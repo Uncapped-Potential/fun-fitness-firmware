@@ -21,7 +21,7 @@ BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
-int dataRate = 24; // 24Hz for battery optimization
+int dataRate = 60; // 24Hz for battery optimization
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -44,7 +44,7 @@ void setup() {
     myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER);
 
     // Initialize BLE
-    BLEDevice::init("FitChip001");
+    BLEDevice::init("FitChip011");
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
