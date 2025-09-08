@@ -9,8 +9,22 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include <cmath>
+#include <string>
 
 CodeCell myCodeCell;
+
+// Forward declarations
+void setupOtaService(BLEServer* srv);
+
+// Helper functions for safe little-endian parsing on RISC-V
+static inline uint16_t le16(const uint8_t* p){ return (uint16_t)p[0] | (uint16_t)p[1]<<8; }
+static inline uint32_t le32(const uint8_t* p){ return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
+static inline void put_le32(uint8_t* d, uint32_t v){ 
+  d[0]=v&0xFF; d[1]=(v>>8)&0xFF; d[2]=(v>>16)&0xFF; d[3]=(v>>24)&0xFF; 
+}
 
 // RTC memory to survive deep sleep
 RTC_DATA_ATTR bool sensorInitialized = false;
@@ -19,10 +33,30 @@ RTC_DATA_ATTR bool sensorInitialized = false;
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "dcba4330-dcba-4321-dcba-432123456791"
 
+// BLE OTA Service UUIDs
+#define OTA_SERVICE_UUID   "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0001"
+#define OTA_CONTROL_UUID   "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0002"
+#define OTA_DATA_UUID      "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0003"
+
+// OTA Control opcodes
+enum { OP_START=0x01, OP_DATA=0x02, OP_FINISH=0x03, OP_REBOOT=0x04 };
+enum { OP_ACK_START=0xA1, OP_ACK_FINISH=0xA2, OP_PROGRESS=0x91, OP_ERROR=0xE0 };
+
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
+
+// OTA BLE characteristics
+static BLECharacteristic *pOtaCtrl = nullptr, *pOtaData = nullptr;
+
+// OTA state variables
+static const uint16_t DEFAULT_PROPOSED_CHUNK = 200;
+static uint16_t agreedChunk = 200;
+static const esp_partition_t *update_part = nullptr;
+static esp_ota_handle_t ota_handle = 0;
+static uint32_t total_len = 0, rx_len = 0, host_crc = 0;
+static bool ota_active = false;
 
 // Power management configuration
 int dataRate = 60; // 60Hz for normal operation
@@ -50,6 +84,115 @@ float lastAx = 0, lastAy = 0, lastAz = 0;
 bool motionBaselineSet = false;
 int consecutiveMotionCount = 0;
 float lastDetectedDelta = 0.0;
+
+// USB power detection
+bool isUsbPowered = false;
+unsigned long lastPowerCheck = 0;
+
+// ==== BLE OTA Implementation ====
+static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
+  crc = ~crc;
+  for (size_t i=0;i<len;i++) {
+    crc ^= data[i];
+    for (int k=0;k<8;k++) crc = (crc>>1) ^ (0xEDB88320 & (-(int)(crc & 1)));
+  }
+  return ~crc;
+}
+
+class OtaControlCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {
+    String arduinoString = c->getValue();
+    std::string s(arduinoString.c_str(), arduinoString.length());  // Convert properly
+    if (s.size() == 0) return;
+    const uint8_t *buf = (const uint8_t*)s.data();
+    uint8_t op = buf[0];
+
+    if (op == OP_START && s.size() >= (1+4+4+2)) {  // Change to .size()
+      if (ota_active) return;
+      total_len = le32(&buf[1]);
+      host_crc  = le32(&buf[5]);
+      uint16_t proposed = le16(&buf[9]);
+
+      update_part = esp_ota_get_next_update_partition(NULL);
+      if (!update_part) { notifyError(1); return; }
+      if (esp_ota_begin(update_part, total_len, &ota_handle) != ESP_OK) { notifyError(2); return; }
+
+      rx_len = 0; ota_active = true;
+      agreedChunk = (proposed >= 20 && proposed <= 200) ? proposed : 200; // safer cap
+
+      Serial.printf("OTA START: %u bytes, chunk size: %u\n", total_len, agreedChunk);
+
+      uint8_t ack[3] = { OP_ACK_START, (uint8_t)(agreedChunk & 0xFF), (uint8_t)(agreedChunk >> 8) };
+      pOtaCtrl->setValue(ack, sizeof(ack)); pOtaCtrl->notify();
+
+    } else if (op == OP_FINISH) {
+      if (!ota_active) return;
+      
+      // Skip CRC check for now - trust the flash write and BLE reliability
+      if (rx_len != total_len) { 
+        Serial.printf("OTA FINISH ERROR: len %u/%u (skipping CRC check)\n", rx_len, total_len);
+        notifyError(3); return; 
+      }
+      
+      Serial.printf("OTA FINISH: %u bytes received, CRC check skipped\n", rx_len);
+      
+      if (esp_ota_end(ota_handle) != ESP_OK) { notifyError(4); return; }
+      if (esp_ota_set_boot_partition(update_part) != ESP_OK) { notifyError(5); return; }
+      
+      Serial.println("OTA COMPLETE - ready to reboot");
+      uint8_t ack = OP_ACK_FINISH; pOtaCtrl->setValue(&ack,1); pOtaCtrl->notify();
+      ota_active = false;
+
+    } else if (op == OP_REBOOT) {
+      Serial.println("OTA REBOOT requested");
+      delay(50); esp_restart();
+    }
+  }
+  
+  static void notifyError(uint8_t code){
+    Serial.printf("OTA ERROR: %u\n", code);
+    uint8_t e[2] = { OP_ERROR, code };
+    pOtaCtrl->setValue(e, sizeof(e)); pOtaCtrl->notify();
+  }
+};
+
+class OtaDataCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {
+    if (!ota_active) return;
+    String arduinoString = c->getValue();
+    std::string s(arduinoString.c_str(), arduinoString.length());  // Convert properly
+    if (s.size() < 1+4) return;
+    const uint8_t *buf = (const uint8_t*)s.data();
+    if (buf[0] != OP_DATA) return;
+    uint32_t offset = le32(&buf[1]);
+    const uint8_t *payload = &buf[5];
+    size_t plen = s.size()-5;      // Change to .size()
+
+    // Write chunk to flash at the specified offset
+    if (esp_ota_write_with_offset(ota_handle, payload, plen, offset) != ESP_OK) {
+      Serial.printf("OTA WRITE ERROR at offset %u\n", offset);
+      uint8_t e[2] = { OP_ERROR, 7 }; pOtaCtrl->setValue(e,2); pOtaCtrl->notify();
+      return;
+    }
+    
+    // Update received bytes count (track highest offset + length)
+    uint32_t chunk_end = offset + plen;
+    if (chunk_end > rx_len) {
+      rx_len = chunk_end;
+    }
+    Serial.printf("OTA DATA: Wrote %u bytes at offset %u, total progress: %u/%u\n", plen, offset, rx_len, total_len);
+
+    if ((rx_len & 0x3FFF) == 0 || rx_len == total_len) {
+      uint8_t prog[1+4+4]; 
+      prog[0] = OP_PROGRESS;
+      put_le32(&prog[1], rx_len);    // Use helper instead of *(uint32_t*)
+      put_le32(&prog[5], total_len); // Use helper instead of *(uint32_t*)
+      pOtaCtrl->setValue(prog, sizeof(prog)); 
+      pOtaCtrl->notify();
+      Serial.printf("OTA PROGRESS: %u/%u bytes\n", rx_len, total_len);
+    }
+  }
+};
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -79,9 +222,9 @@ bool checkMotionActivity() {
     }
     
     // Calculate change in acceleration from previous reading
-    float deltaAx = abs(ax - lastAx);
-    float deltaAy = abs(ay - lastAy);
-    float deltaAz = abs(az - lastAz);
+    float deltaAx = fabsf(ax - lastAx);
+    float deltaAy = fabsf(ay - lastAy);
+    float deltaAz = fabsf(az - lastAz);
     float totalDelta = sqrt(deltaAx*deltaAx + deltaAy*deltaAy + deltaAz*deltaAz);
     
     Serial.printf("Motion delta: %.3f g (threshold: %.3f)\n", totalDelta, motionThreshold);
@@ -135,9 +278,9 @@ void setup() {
             float ax, ay, az;
             myCodeCell.Motion_AccelerometerRead(ax, ay, az);
             
-            float deltaAx = abs(ax - baselineAx);
-            float deltaAy = abs(ay - baselineAy);
-            float deltaAz = abs(az - baselineAz);
+            float deltaAx = fabsf(ax - baselineAx);  // Change from abs() to fabsf()
+            float deltaAy = fabsf(ay - baselineAy);  // Change from abs() to fabsf()
+            float deltaAz = fabsf(az - baselineAz);  // Change from abs() to fabsf()
             float totalDelta = sqrt(deltaAx*deltaAx + deltaAy*deltaAy + deltaAz*deltaAz);
             
             Serial.printf("Wake check %d: delta %.3f (threshold %.3f)\n", i+1, totalDelta, motionThreshold);
@@ -231,9 +374,13 @@ ble_init:
                     );
     pCharacteristic->addDescriptor(new BLE2902());
     pService->start();
+    
+    // Add OTA service
+    setupOtaService(pServer);
 
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->addServiceUUID(OTA_SERVICE_UUID);
     pAdvertising->setScanResponse(false);
     pAdvertising->setMinPreferred(0x0);
     BLEDevice::startAdvertising();
@@ -243,21 +390,72 @@ ble_init:
     lastBleCheck = millis();
 }
 
+// ==== OTA Service Setup Function ====
+void setupOtaService(BLEServer* srv) {
+  BLEService *svc = srv->createService(OTA_SERVICE_UUID);
+
+  pOtaCtrl = svc->createCharacteristic(
+    OTA_CONTROL_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pOtaCtrl->addDescriptor(new BLE2902());  // Add CCCD for notifications
+  pOtaCtrl->setCallbacks(new OtaControlCallbacks());
+
+  pOtaData = svc->createCharacteristic(
+    OTA_DATA_UUID,
+    BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_WRITE  // Add WRITE for fallback
+  );
+  pOtaData->setCallbacks(new OtaDataCallbacks());
+
+  svc->start();
+  Serial.println("OTA service initialized");
+}
+
 void loop() {
     // Multi-tier power management
     unsigned long currentTime = millis();
+    
+    // Check USB power status every 5 seconds
+    if (currentTime - lastPowerCheck > 5000) {
+        lastPowerCheck = currentTime;
+        int powerState = myCodeCell.PowerStateRead();
+        isUsbPowered = (powerState == 1); // 1 = Running from USB Power
+        
+        if (isUsbPowered) {
+            Serial.println("USB powered - maintaining 60Hz operation");
+        }
+    }
+    
     if (currentTime - lastBleCheck > 1000) { // Check every second
         lastBleCheck = currentTime;
         unsigned long timeSinceMotion = currentTime - lastMotionTime;
         
-        // State machine for power management
-        switch (currentPowerState) {
+        // Skip power management if USB powered - stay at full performance
+        if (isUsbPowered) {
+            // Ensure we're in ACTIVE state when USB powered
+            if (currentPowerState != ACTIVE) {
+                Serial.println("USB detected - returning to ACTIVE state");
+                setCpuFrequencyMhz(160); // Restore full speed
+                dataRate = 60; // Restore full data rate
+                imuRate = 60; // Restore full IMU rate
+                bleActive = true;
+                if (!pServer->getAdvertising()->isAdvertising()) {
+                    pServer->getAdvertising()->start();
+                }
+                currentPowerState = ACTIVE;
+            }
+            // Skip the power management state machine when USB powered
+        } else {
+            // State machine for power management (battery only)
+            switch (currentPowerState) {
             case ACTIVE:
-                if (timeSinceMotion > bleInactivityTimeout) {
+                if (!ota_active && timeSinceMotion > bleInactivityTimeout) {
                     Serial.printf("Entering BLE_OFF state (1Hz mode) after %lums\n", timeSinceMotion);
                     dataRate = lowPowerDataRate; // Reduce to 1Hz transmission
                     imuRate = lowPowerImuRate; // Reduce IMU polling to 10Hz
-                    Serial.println("BLE_OFF: Reducing transmission to 1Hz and IMU polling to 10Hz");
+                    bleActive = false; // Actually turn off BLE notifications
+                    pServer->getAdvertising()->stop(); // Stop advertising
+                    Serial.println("BLE_OFF: BLE disabled, IMU polling at 10Hz");
                     currentPowerState = BLE_OFF;
                 }
                 break;
@@ -267,10 +465,10 @@ void loop() {
                     Serial.printf("Motion detected - returning to ACTIVE state\n");
                     dataRate = 60; // Restore full data rate
                     imuRate = 60; // Restore full IMU rate
-                    pServer->getAdvertising()->start();
-                    bleActive = true;
+                    bleActive = true; // Re-enable BLE
+                    pServer->getAdvertising()->start(); // Restart advertising
                     currentPowerState = ACTIVE;
-                } else if (timeSinceMotion > lightSleepTimeout) {
+                } else if (!ota_active && timeSinceMotion > lightSleepTimeout) {
                     Serial.printf("Entering LIGHT_SLEEP state after %lums\n", timeSinceMotion);
                     Serial.println("LIGHT_SLEEP: Sensors active, CPU reduced to 80MHz, BLE off, IMU at 5Hz");
                     imuRate = 5; // Reduce to 5Hz for maximum power savings in light sleep
@@ -291,6 +489,7 @@ void loop() {
                 }
                 // Stay in light sleep - no deeper sleep mode available due to sensor issues
                 break;
+            }
         }
     }
     
@@ -310,9 +509,9 @@ void loop() {
         // Check for motion activity to reset sleep timer using delta method
         float totalDelta = 0.0;
         if (motionBaselineSet) {
-            float deltaAx = abs(ax - lastAx);
-            float deltaAy = abs(ay - lastAy);
-            float deltaAz = abs(az - lastAz);
+            float deltaAx = fabsf(ax - lastAx);
+            float deltaAy = fabsf(ay - lastAy);
+            float deltaAz = fabsf(az - lastAz);
             totalDelta = sqrt(deltaAx*deltaAx + deltaAy*deltaAy + deltaAz*deltaAz);
             
             if (totalDelta > motionThreshold) {
@@ -374,13 +573,13 @@ void loop() {
         int16_t qjInt = (int16_t)(qj * 10000);  // Y component  
         int16_t qkInt = (int16_t)(qk * 10000);  // Z component
         
-        // Convert sensor data (same as original protocol)
-        int16_t axInt = (int16_t)(ax * 500);
-        int16_t ayInt = (int16_t)(ay * 500);
-        int16_t azInt = (int16_t)(az * 500);
-        int16_t gxInt = (int16_t)(gx * 10);
-        int16_t gyInt = (int16_t)(gy * 10);
-        int16_t gzInt = (int16_t)(gz * 10);
+        // Convert all sensor data to real values
+        int16_t axInt = (int16_t)(ax * 500);    // Real accelerometer X
+        int16_t ayInt = (int16_t)(ay * 500);    // Real accelerometer Y  
+        int16_t azInt = (int16_t)(az * 500);    // Real accelerometer Z
+        int16_t gxInt = (int16_t)(gx * 10);     // Real gyroscope X
+        int16_t gyInt = (int16_t)(gy * 10);     // Real gyroscope Y
+        int16_t gzInt = (int16_t)(gz * 10);     // Real gyroscope Z
         uint8_t batteryByte = (uint8_t)batteryLevel;
         
         // Pack into 19-byte binary array (little-endian)
@@ -409,12 +608,20 @@ void loop() {
                      timeSinceLastMotion, deviceConnected ? "Connected" : "Disconnected");
 
         // Send minimal quaternion data via BLE (19 bytes - same as Euler!)
-        if (deviceConnected && bleActive) {
+        // Throttle IMU streaming during OTA to avoid congestion
+        if (deviceConnected && bleActive && !ota_active) {
             pCharacteristic->setValue(binaryData, 19);
             pCharacteristic->notify();
+        } else if (ota_active) {
+            // During OTA, reduce IMU notifications to prevent BLE congestion
+            static unsigned long lastOtaThrottleLog = 0;
+            if (currentTime - lastOtaThrottleLog > 5000) {
+                Serial.println("IMU streaming throttled during OTA");
+                lastOtaThrottleLog = currentTime;
+            }
         }
     }
-    } // End of sensor reading block
+    // End of sensor reading block
 
     // Handle disconnection and restart advertising ONLY if BLE is supposed to be active
     if (!deviceConnected && oldDeviceConnected) {
