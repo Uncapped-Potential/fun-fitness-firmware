@@ -22,6 +22,7 @@ bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
 int dataRate = 60; // 24Hz for battery optimization
+bool removeGravity = true; // Toggle to remove gravity from accelerometer readings
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -40,8 +41,8 @@ void setup() {
     delay(1000);
     Serial.println("CodeCell BLE Minimal Quaternion Streamer - 19 bytes, Gimbal Lock Free!");
 
-    // Initialize all motion sensors including magnetometer
-    myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER);
+    // Initialize all motion sensors including magnetometer and linear acceleration
+    myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER + MOTION_LINEAR_ACC + MOTION_GRAVITY);
 
     // Initialize BLE
     BLEDevice::init("FitChip011");
@@ -75,7 +76,16 @@ void loop() {
         // Read accelerometer and gyro data
         float ax, ay, az;
         float gx, gy, gz;
-        myCodeCell.Motion_AccelerometerRead(ax, ay, az);
+        
+        // Option to remove gravity from accelerometer readings
+        if (removeGravity) {
+            // Use linear acceleration (gravity already removed by sensor fusion)
+            myCodeCell.Motion_LinearAccRead(ax, ay, az);
+        } else {
+            // Use raw accelerometer (includes gravity)
+            myCodeCell.Motion_AccelerometerRead(ax, ay, az);
+        }
+        
         myCodeCell.Motion_GyroRead(gx, gy, gz);
 
         // Read battery level
@@ -92,9 +102,9 @@ void loop() {
          * [0-1]   Quat X (int16_t)    - Range: ±1.0,      Scale: 10000,   Precision: 0.0001
          * [2-3]   Quat Y (int16_t)    - Range: ±1.0,      Scale: 10000,   Precision: 0.0001  
          * [4-5]   Quat Z (int16_t)    - Range: ±1.0,      Scale: 10000,   Precision: 0.0001
-         * [6-7]   Accel X (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g
-         * [8-9]   Accel Y (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g
-         * [10-11] Accel Z (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g
+         * [6-7]   Accel X (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g (gravity removed if enabled)
+         * [8-9]   Accel Y (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g (gravity removed if enabled)
+         * [10-11] Accel Z (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g (gravity removed if enabled)
          * [12-13] Gyro X (int16_t)    - Range: ±3276°/s,  Scale: 10,      Precision: 0.1°/s
          * [14-15] Gyro Y (int16_t)    - Range: ±3276°/s,  Scale: 10,      Precision: 0.1°/s
          * [16-17] Gyro Z (int16_t)    - Range: ±3276°/s,  Scale: 10,      Precision: 0.1°/s
