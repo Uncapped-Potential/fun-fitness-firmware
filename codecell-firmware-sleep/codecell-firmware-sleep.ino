@@ -32,6 +32,7 @@ RTC_DATA_ATTR bool sensorInitialized = false;
 // BLE UUIDs (matching MicroLink for compatibility)
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "dcba4330-dcba-4321-dcba-432123456791"
+#define CONFIG_CHAR_UUID    "dcba4330-dcba-4321-dcba-432123456792"  // Configuration characteristic
 
 // BLE OTA Service UUIDs
 #define OTA_SERVICE_UUID   "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0001"
@@ -44,6 +45,7 @@ enum { OP_ACK_START=0xA1, OP_ACK_FINISH=0xA2, OP_PROGRESS=0x91, OP_ERROR=0xE0 };
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
+BLECharacteristic* pConfigCharacteristic = NULL;  // Config characteristic
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -59,7 +61,7 @@ static uint32_t total_len = 0, rx_len = 0, host_crc = 0;
 static bool ota_active = false;
 
 // Power management configuration
-int dataRate = 60; // 60Hz for normal operation
+int dataRate = 60; // 60Hz for normal operation - configurable via BLE
 int lowPowerDataRate = 1; // 1Hz for low power mode
 int imuRate = 60; // IMU polling rate (matches dataRate for normal operation)
 int lowPowerImuRate = 10; // Reduced IMU rate for power saving (still responsive for motion detection)
@@ -67,6 +69,17 @@ float motionThreshold = 0.4; // Minimum change in acceleration to detect motion 
 int consecutiveMotionRequired = 2; // Require consecutive motion readings to confirm real motion
 int bleInactivityTimeout = 10000; // Reduce BLE rate after 10 seconds of no motion
 int lightSleepTimeout = 60000; // Enter light sleep (sensor only) after 1 minute
+
+// Configurable parameters
+bool removeGravity = false; // Toggle gravity removal - configurable via BLE
+
+// Command IDs for configuration
+enum ConfigCommands {
+    CMD_SET_GRAVITY = 0x01,    // Toggle gravity removal (0=raw, 1=removed)
+    CMD_SET_DATA_RATE = 0x02,  // Set data rate in Hz (10-100)
+    CMD_SET_SLEEP_TIMEOUT = 0x03, // Set sleep timeout in seconds
+    CMD_GET_CONFIG = 0x04      // Request current config
+};
 
 // Deep sleep removed - it completely breaks BNO085 sensor functionality
 // Even with RST pin tied to 3.3V, the sensor loses all configuration during ESP32 deep sleep
@@ -194,6 +207,81 @@ class OtaDataCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// Callback for handling configuration writes
+class ConfigCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        
+        if (value.length() > 0) {
+            uint8_t cmd = value[0];
+            
+            switch (cmd) {
+                case CMD_SET_GRAVITY:
+                    if (value.length() >= 2) {
+                        removeGravity = value[1] > 0;
+                        Serial.print("Gravity removal set to: ");
+                        Serial.println(removeGravity ? "ON" : "OFF");
+                        
+                        // Send acknowledgment back
+                        uint8_t ack[2] = {CMD_SET_GRAVITY, removeGravity};
+                        pCharacteristic->setValue(ack, 2);
+                        pCharacteristic->notify();
+                    }
+                    break;
+                    
+                case CMD_SET_DATA_RATE:
+                    if (value.length() >= 2) {
+                        int newRate = value[1];
+                        if (newRate >= 10 && newRate <= 100) {
+                            dataRate = newRate;
+                            imuRate = newRate; // Keep IMU rate synced
+                            Serial.print("Data rate set to: ");
+                            Serial.print(dataRate);
+                            Serial.println(" Hz");
+                            
+                            // Send acknowledgment
+                            uint8_t ack[2] = {CMD_SET_DATA_RATE, (uint8_t)dataRate};
+                            pCharacteristic->setValue(ack, 2);
+                            pCharacteristic->notify();
+                        }
+                    }
+                    break;
+                    
+                case CMD_SET_SLEEP_TIMEOUT:
+                    if (value.length() >= 2) {
+                        int timeoutSec = value[1];
+                        if (timeoutSec >= 5 && timeoutSec <= 255) {
+                            bleInactivityTimeout = timeoutSec * 1000;
+                            Serial.print("Sleep timeout set to: ");
+                            Serial.print(timeoutSec);
+                            Serial.println(" seconds");
+                            
+                            // Send acknowledgment
+                            uint8_t ack[2] = {CMD_SET_SLEEP_TIMEOUT, (uint8_t)timeoutSec};
+                            pCharacteristic->setValue(ack, 2);
+                            pCharacteristic->notify();
+                        }
+                    }
+                    break;
+                    
+                case CMD_GET_CONFIG:
+                    // Send current configuration
+                    uint8_t config[5] = {
+                        CMD_GET_CONFIG,
+                        removeGravity,
+                        (uint8_t)dataRate,
+                        (uint8_t)(bleInactivityTimeout / 1000),
+                        0  // Reserved for future use
+                    };
+                    pCharacteristic->setValue(config, 5);
+                    pCharacteristic->notify();
+                    Serial.println("Configuration sent to client");
+                    break;
+            }
+        }
+    }
+};
+
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
@@ -317,9 +405,9 @@ void setup() {
         Serial.println("Sensor stabilization delay...");
         delay(3000);
         
-        // Try full sensor initialization first
+        // Try full sensor initialization first including linear acceleration for gravity removal
         Serial.println("Attempting full sensor suite initialization...");
-        myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER);
+        myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER + MOTION_LINEAR_ACC + MOTION_GRAVITY);
         
         // Test if full sensors work
         delay(1000);
@@ -373,6 +461,21 @@ ble_init:
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
     pCharacteristic->addDescriptor(new BLE2902());
+    
+    // Create configuration characteristic (read/write/notify)
+    pConfigCharacteristic = pService->createCharacteristic(
+                          CONFIG_CHAR_UUID,
+                          BLECharacteristic::PROPERTY_READ |
+                          BLECharacteristic::PROPERTY_WRITE |
+                          BLECharacteristic::PROPERTY_NOTIFY
+                        );
+    pConfigCharacteristic->setCallbacks(new ConfigCallbacks());
+    pConfigCharacteristic->addDescriptor(new BLE2902());
+    
+    // Set initial config values
+    uint8_t initialConfig[5] = {CMD_GET_CONFIG, removeGravity, (uint8_t)dataRate, (uint8_t)(bleInactivityTimeout / 1000), 0};
+    pConfigCharacteristic->setValue(initialConfig, 5);
+    
     pService->start();
     
     // Add OTA service
@@ -386,6 +489,11 @@ ble_init:
     BLEDevice::startAdvertising();
 
     Serial.println("Ready for computer GUI connection...");
+    Serial.println("Configuration commands available via BLE:");
+    Serial.println("  - CMD_SET_GRAVITY (0x01): Toggle gravity removal");
+    Serial.println("  - CMD_SET_DATA_RATE (0x02): Set polling rate (10-100 Hz)");
+    Serial.println("  - CMD_SET_SLEEP_TIMEOUT (0x03): Set sleep timeout (5-255 seconds)");
+    Serial.println("  - CMD_GET_CONFIG (0x04): Get current configuration");
     lastMotionTime = millis();
     lastBleCheck = millis();
 }
@@ -503,7 +611,16 @@ void loop() {
         // Read accelerometer and gyro data
         float ax, ay, az;
         float gx, gy, gz;
-        myCodeCell.Motion_AccelerometerRead(ax, ay, az);
+        
+        // Use configured gravity removal setting
+        if (removeGravity) {
+            // Use linear acceleration (gravity already removed by sensor fusion)
+            myCodeCell.Motion_LinearAccRead(ax, ay, az);
+        } else {
+            // Use raw accelerometer (includes gravity)
+            myCodeCell.Motion_AccelerometerRead(ax, ay, az);
+        }
+        
         myCodeCell.Motion_GyroRead(gx, gy, gz);
 
         // Check for motion activity to reset sleep timer using delta method
