@@ -210,7 +210,8 @@ class OtaDataCallbacks : public BLECharacteristicCallbacks {
 // Callback for handling configuration writes
 class ConfigCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string value = pCharacteristic->getValue();
+        String arduinoString = pCharacteristic->getValue();
+        std::string value(arduinoString.c_str(), arduinoString.length());
         
         if (value.length() > 0) {
             uint8_t cmd = value[0];
