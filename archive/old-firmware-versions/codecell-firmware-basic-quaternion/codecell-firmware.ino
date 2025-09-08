@@ -15,80 +15,13 @@ CodeCell myCodeCell;
 // BLE UUIDs (matching MicroLink for compatibility)
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "dcba4330-dcba-4321-dcba-432123456791"
-#define CONFIG_CHAR_UUID    "dcba4330-dcba-4321-dcba-432123456792"  // New config characteristic
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
-BLECharacteristic* pConfigCharacteristic = NULL;  // Config characteristic
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
-// Configurable parameters
-int dataRate = 60; // Hz - configurable via BLE
-bool removeGravity = false; // Toggle gravity removal - configurable via BLE (default: false for compatibility)
-
-// Command IDs for configuration
-enum ConfigCommands {
-    CMD_SET_GRAVITY = 0x01,    // Toggle gravity removal (0=raw, 1=removed)
-    CMD_SET_DATA_RATE = 0x02,  // Set data rate in Hz (10-100)
-    CMD_GET_CONFIG = 0x03      // Request current config
-};
-
-// Callback for handling configuration writes
-class ConfigCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string value = pCharacteristic->getValue();
-        
-        if (value.length() > 0) {
-            uint8_t cmd = value[0];
-            
-            switch (cmd) {
-                case CMD_SET_GRAVITY:
-                    if (value.length() >= 2) {
-                        removeGravity = value[1] > 0;
-                        Serial.print("Gravity removal set to: ");
-                        Serial.println(removeGravity ? "ON" : "OFF");
-                        
-                        // Send acknowledgment back
-                        uint8_t ack[2] = {CMD_SET_GRAVITY, removeGravity};
-                        pCharacteristic->setValue(ack, 2);
-                        pCharacteristic->notify();
-                    }
-                    break;
-                    
-                case CMD_SET_DATA_RATE:
-                    if (value.length() >= 2) {
-                        int newRate = value[1];
-                        if (newRate >= 10 && newRate <= 100) {
-                            dataRate = newRate;
-                            Serial.print("Data rate set to: ");
-                            Serial.print(dataRate);
-                            Serial.println(" Hz");
-                            
-                            // Send acknowledgment
-                            uint8_t ack[2] = {CMD_SET_DATA_RATE, (uint8_t)dataRate};
-                            pCharacteristic->setValue(ack, 2);
-                            pCharacteristic->notify();
-                        }
-                    }
-                    break;
-                    
-                case CMD_GET_CONFIG:
-                    // Send current configuration
-                    uint8_t config[4] = {
-                        CMD_GET_CONFIG,
-                        removeGravity,
-                        (uint8_t)dataRate,
-                        0  // Reserved for future use
-                    };
-                    pCharacteristic->setValue(config, 4);
-                    pCharacteristic->notify();
-                    Serial.println("Configuration sent to client");
-                    break;
-            }
-        }
-    }
-};
+int dataRate = 60; // 24Hz for battery optimization
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -107,8 +40,8 @@ void setup() {
     delay(1000);
     Serial.println("CodeCell BLE Minimal Quaternion Streamer - 19 bytes, Gimbal Lock Free!");
 
-    // Initialize all motion sensors including magnetometer, linear acceleration, and gravity
-    myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER + MOTION_LINEAR_ACC + MOTION_GRAVITY);
+    // Initialize all motion sensors including magnetometer
+    myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER);
 
     // Initialize BLE
     BLEDevice::init("FitChip011");
@@ -122,21 +55,6 @@ void setup() {
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
     pCharacteristic->addDescriptor(new BLE2902());
-    
-    // Create configuration characteristic (read/write/notify)
-    pConfigCharacteristic = pService->createCharacteristic(
-                          CONFIG_CHAR_UUID,
-                          BLECharacteristic::PROPERTY_READ |
-                          BLECharacteristic::PROPERTY_WRITE |
-                          BLECharacteristic::PROPERTY_NOTIFY
-                        );
-    pConfigCharacteristic->setCallbacks(new ConfigCallbacks());
-    pConfigCharacteristic->addDescriptor(new BLE2902());
-    
-    // Set initial config values
-    uint8_t initialConfig[4] = {CMD_GET_CONFIG, removeGravity, (uint8_t)dataRate, 0};
-    pConfigCharacteristic->setValue(initialConfig, 4);
-    
     pService->start();
 
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -146,10 +64,6 @@ void setup() {
     BLEDevice::startAdvertising();
 
     Serial.println("Ready for computer GUI connection...");
-    Serial.println("Configuration commands available via BLE:");
-    Serial.println("  - CMD_SET_GRAVITY (0x01): Toggle gravity removal");
-    Serial.println("  - CMD_SET_DATA_RATE (0x02): Set polling rate (10-100 Hz)");
-    Serial.println("  - CMD_GET_CONFIG (0x03): Get current configuration");
 }
 
 void loop() {
@@ -161,16 +75,7 @@ void loop() {
         // Read accelerometer and gyro data
         float ax, ay, az;
         float gx, gy, gz;
-        
-        // Use configured gravity removal setting
-        if (removeGravity) {
-            // Use linear acceleration (gravity already removed by sensor fusion)
-            myCodeCell.Motion_LinearAccRead(ax, ay, az);
-        } else {
-            // Use raw accelerometer (includes gravity)
-            myCodeCell.Motion_AccelerometerRead(ax, ay, az);
-        }
-        
+        myCodeCell.Motion_AccelerometerRead(ax, ay, az);
         myCodeCell.Motion_GyroRead(gx, gy, gz);
 
         // Read battery level
@@ -187,9 +92,9 @@ void loop() {
          * [0-1]   Quat X (int16_t)    - Range: ±1.0,      Scale: 10000,   Precision: 0.0001
          * [2-3]   Quat Y (int16_t)    - Range: ±1.0,      Scale: 10000,   Precision: 0.0001  
          * [4-5]   Quat Z (int16_t)    - Range: ±1.0,      Scale: 10000,   Precision: 0.0001
-         * [6-7]   Accel X (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g (gravity removed if enabled)
-         * [8-9]   Accel Y (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g (gravity removed if enabled)
-         * [10-11] Accel Z (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g (gravity removed if enabled)
+         * [6-7]   Accel X (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g
+         * [8-9]   Accel Y (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g
+         * [10-11] Accel Z (int16_t)   - Range: ±65.5g,    Scale: 500,     Precision: 0.002g
          * [12-13] Gyro X (int16_t)    - Range: ±3276°/s,  Scale: 10,      Precision: 0.1°/s
          * [14-15] Gyro Y (int16_t)    - Range: ±3276°/s,  Scale: 10,      Precision: 0.1°/s
          * [16-17] Gyro Z (int16_t)    - Range: ±3276°/s,  Scale: 10,      Precision: 0.1°/s
