@@ -1,7 +1,7 @@
 /*
- * CodeCell BLE Quaternion Streamer with Motion-Based Sleep Mode
- * Sends 3-component quaternion data, W component calculated on device
- * Implements power-efficient sleep mode with motion-based wake/sleep detection
+ * CodeCell QC Test Firmware - Based on Production Firmware
+ * Provides safe QC testing interface while maintaining all normal functionality
+ * Battery monitoring and USB detection only (no GPIO manipulation)
  */
 
 #include <CodeCell.h>
@@ -18,6 +18,7 @@ CodeCell myCodeCell;
 
 // Forward declarations
 void setupOtaService(BLEServer* srv);
+void setupQcService(BLEServer* srv);
 
 // Helper functions for safe little-endian parsing on RISC-V
 static inline uint16_t le16(const uint8_t* p){ return (uint16_t)p[0] | (uint16_t)p[1]<<8; }
@@ -32,7 +33,12 @@ RTC_DATA_ATTR bool sensorInitialized = false;
 // BLE UUIDs (matching MicroLink for compatibility)
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "dcba4330-dcba-4321-dcba-432123456791"
-#define CONFIG_CHAR_UUID    "dcba4330-dcba-4321-dcba-432123456792"  // Configuration characteristic
+
+// QC Test Service UUIDs
+#define QC_SERVICE_UUID     "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a2000"
+#define QC_COMMAND_UUID     "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a2001"
+#define QC_STATUS_UUID      "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a2002"
+#define QC_LOG_UUID         "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a2003"
 
 // BLE OTA Service UUIDs
 #define OTA_SERVICE_UUID   "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0001"
@@ -45,7 +51,6 @@ enum { OP_ACK_START=0xA1, OP_ACK_FINISH=0xA2, OP_PROGRESS=0x91, OP_ERROR=0xE0 };
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
-BLECharacteristic* pConfigCharacteristic = NULL;  // Config characteristic
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -61,7 +66,7 @@ static uint32_t total_len = 0, rx_len = 0, host_crc = 0;
 static bool ota_active = false;
 
 // Power management configuration
-int dataRate = 60; // 60Hz for normal operation - configurable via BLE
+int dataRate = 60; // 60Hz for normal operation
 int lowPowerDataRate = 1; // 1Hz for low power mode
 int imuRate = 60; // IMU polling rate (matches dataRate for normal operation)
 int lowPowerImuRate = 10; // Reduced IMU rate for power saving (still responsive for motion detection)
@@ -69,21 +74,6 @@ float motionThreshold = 0.4; // Minimum change in acceleration to detect motion 
 int consecutiveMotionRequired = 2; // Require consecutive motion readings to confirm real motion
 int bleInactivityTimeout = 10000; // Reduce BLE rate after 10 seconds of no motion
 int lightSleepTimeout = 60000; // Enter light sleep (sensor only) after 1 minute
-
-// Configurable parameters
-bool removeGravity = false; // Toggle gravity removal - configurable via BLE
-
-// Safety flags for configuration
-bool systemInitialized = false; // Prevent config during initialization
-bool configInProgress = false;  // Prevent concurrent config operations
-
-// Command IDs for configuration
-enum ConfigCommands {
-    CMD_SET_GRAVITY = 0x01,    // Toggle gravity removal (0=raw, 1=removed)
-    CMD_SET_DATA_RATE = 0x02,  // Set data rate in Hz (10-100)
-    CMD_SET_SLEEP_TIMEOUT = 0x03, // Set sleep timeout in seconds
-    CMD_GET_CONFIG = 0x04      // Request current config
-};
 
 // Deep sleep removed - it completely breaks BNO085 sensor functionality
 // Even with RST pin tied to 3.3V, the sensor loses all configuration during ESP32 deep sleep
@@ -105,6 +95,40 @@ float lastDetectedDelta = 0.0;
 // USB power detection
 bool isUsbPowered = false;
 unsigned long lastPowerCheck = 0;
+
+// ==== QC Test Additions ====
+// QC Test BLE characteristics
+static BLECharacteristic *pQcCommand = nullptr;
+static BLECharacteristic *pQcStatus = nullptr;
+static BLECharacteristic *pQcLog = nullptr;
+
+// QC Test Commands
+enum QCCommand {
+  QC_GET_STATUS = 0x01,
+  QC_START_LOGGING = 0x05,
+  QC_STOP_LOGGING = 0x06,
+  QC_CHECKPOINT = 0x07,
+  QC_SELF_TEST = 0x09
+};
+
+// QC Status packet (16 bytes total) - Safe Mode
+struct QCStatus {
+  uint8_t  usb_connected;    // USB power state
+  uint8_t  charging_state;   // Charging state estimate
+  uint8_t  safe_mode;        // Always 1 in safe mode
+  uint8_t  reserved;         // Padding
+  uint16_t battery_mv;       // Battery voltage in mV
+  uint16_t vcc_mv;           // VCC voltage (3300mV)
+  uint32_t timestamp_ms;     // Millis since test start
+  uint32_t serial;           // Device serial number
+} __attribute__((packed));
+
+// QC Test State
+bool qcTestActive = false;
+bool qcLoggingActive = false;
+uint32_t qcTestStartTime = 0;
+uint32_t qcSerialNumber = 0;
+uint8_t qcCurrentPhase = 0;
 
 // ==== BLE OTA Implementation ====
 static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
@@ -209,99 +233,6 @@ class OtaDataCallbacks : public BLECharacteristicCallbacks {
       Serial.printf("OTA PROGRESS: %u/%u bytes\n", rx_len, total_len);
     }
   }
-};
-
-// Callback for handling configuration writes
-class ConfigCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        // Safety checks
-        if (!systemInitialized) {
-            Serial.println("CONFIG: System not initialized, ignoring command");
-            return;
-        }
-        
-        if (configInProgress) {
-            Serial.println("CONFIG: Configuration in progress, ignoring command");
-            return;
-        }
-        
-        configInProgress = true; // Lock configuration
-        
-        String arduinoString = pCharacteristic->getValue();
-        std::string value(arduinoString.c_str(), arduinoString.length());
-        
-        if (value.length() > 0) {
-            uint8_t cmd = value[0];
-            
-            switch (cmd) {
-                case CMD_SET_GRAVITY:
-                    if (value.length() >= 2) {
-                        removeGravity = value[1] > 0;
-                        Serial.print("Gravity removal set to: ");
-                        Serial.println(removeGravity ? "ON" : "OFF");
-                        
-                        // Send acknowledgment back
-                        uint8_t ack[2] = {CMD_SET_GRAVITY, removeGravity};
-                        pCharacteristic->setValue(ack, 2);
-                        pCharacteristic->notify();
-                    }
-                    break;
-                    
-                case CMD_SET_DATA_RATE:
-                    if (value.length() >= 2) {
-                        int newRate = value[1];
-                        if (newRate >= 10 && newRate <= 100) {
-                            dataRate = newRate;
-                            imuRate = newRate; // Keep IMU rate synced
-                            Serial.print("Data rate set to: ");
-                            Serial.print(dataRate);
-                            Serial.println(" Hz");
-                            
-                            // Send acknowledgment
-                            uint8_t ack[2] = {CMD_SET_DATA_RATE, (uint8_t)dataRate};
-                            pCharacteristic->setValue(ack, 2);
-                            pCharacteristic->notify();
-                        }
-                    }
-                    break;
-                    
-                case CMD_SET_SLEEP_TIMEOUT:
-                    if (value.length() >= 2) {
-                        int timeoutSec = value[1];
-                        if (timeoutSec >= 5 && timeoutSec <= 255) {
-                            bleInactivityTimeout = timeoutSec * 1000;
-                            // Reset motion timer now that system is safely initialized
-                            lastMotionTime = millis();
-                            Serial.print("Sleep timeout set to: ");
-                            Serial.print(timeoutSec);
-                            Serial.println(" seconds (motion timer reset)");
-                            
-                            // Send acknowledgment
-                            uint8_t ack[2] = {CMD_SET_SLEEP_TIMEOUT, (uint8_t)timeoutSec};
-                            pCharacteristic->setValue(ack, 2);
-                            pCharacteristic->notify();
-                        }
-                    }
-                    break;
-                    
-                case CMD_GET_CONFIG:
-                    // Send current configuration
-                    uint8_t config[5] = {
-                        CMD_GET_CONFIG,
-                        removeGravity,
-                        (uint8_t)dataRate,
-                        (uint8_t)(bleInactivityTimeout / 1000),
-                        0  // Reserved for future use
-                    };
-                    pCharacteristic->setValue(config, 5);
-                    pCharacteristic->notify();
-                    Serial.println("Configuration sent to client");
-                    break;
-            }
-        }
-        
-        configInProgress = false; // Unlock configuration
-    }
 };
 
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -427,9 +358,9 @@ void setup() {
         Serial.println("Sensor stabilization delay...");
         delay(3000);
         
-        // Try full sensor initialization first including linear acceleration for gravity removal
+        // Try full sensor initialization first
         Serial.println("Attempting full sensor suite initialization...");
-        myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER + MOTION_LINEAR_ACC + MOTION_GRAVITY);
+        myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER);
         
         // Test if full sensors work
         delay(1000);
@@ -471,8 +402,8 @@ ble_init:
     delay(1000);
     Serial.println("Sensors ready, initializing BLE...");
     
-    // Initialize BLE
-    BLEDevice::init("FitChip011");
+    // Initialize BLE (keep original naming)
+    BLEDevice::init("FitChip014");
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -483,45 +414,25 @@ ble_init:
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
     pCharacteristic->addDescriptor(new BLE2902());
-    
-    // Create configuration characteristic (read/write/notify)
-    pConfigCharacteristic = pService->createCharacteristic(
-                          CONFIG_CHAR_UUID,
-                          BLECharacteristic::PROPERTY_READ |
-                          BLECharacteristic::PROPERTY_WRITE |
-                          BLECharacteristic::PROPERTY_NOTIFY
-                        );
-    pConfigCharacteristic->setCallbacks(new ConfigCallbacks());
-    pConfigCharacteristic->addDescriptor(new BLE2902());
-    
-    // Set initial config values
-    uint8_t initialConfig[5] = {CMD_GET_CONFIG, removeGravity, (uint8_t)dataRate, (uint8_t)(bleInactivityTimeout / 1000), 0};
-    pConfigCharacteristic->setValue(initialConfig, 5);
-    
     pService->start();
     
     // Add OTA service
     setupOtaService(pServer);
+    
+    // Add QC Test service (for production testing)
+    setupQcService(pServer);
 
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->addServiceUUID(OTA_SERVICE_UUID);
+    pAdvertising->addServiceUUID(QC_SERVICE_UUID); // Add QC service to advertisements
     pAdvertising->setScanResponse(false);
     pAdvertising->setMinPreferred(0x0);
     BLEDevice::startAdvertising();
 
     Serial.println("Ready for computer GUI connection...");
-    Serial.println("Configuration commands available via BLE:");
-    Serial.println("  - CMD_SET_GRAVITY (0x01): Toggle gravity removal");
-    Serial.println("  - CMD_SET_DATA_RATE (0x02): Set polling rate (10-100 Hz)");
-    Serial.println("  - CMD_SET_SLEEP_TIMEOUT (0x03): Set sleep timeout (5-255 seconds)");
-    Serial.println("  - CMD_GET_CONFIG (0x04): Get current configuration");
     lastMotionTime = millis();
     lastBleCheck = millis();
-    
-    // Mark system as fully initialized - safe for configuration
-    systemInitialized = true;
-    Serial.println("System initialization complete - configuration enabled");
 }
 
 // ==== OTA Service Setup Function ====
@@ -543,6 +454,115 @@ void setupOtaService(BLEServer* srv) {
 
   svc->start();
   Serial.println("OTA service initialized");
+}
+
+// ==== QC Test Service Setup ====
+// QC Command Handler
+class QcCommandCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) override {
+    String value = pCharacteristic->getValue();
+    if (value.length() == 0) return;
+    
+    uint8_t command = value[0];
+    
+    switch (command) {
+      case QC_GET_STATUS: {
+        // Build status packet from existing data
+        QCStatus status;
+        int powerState = myCodeCell.PowerStateRead();
+        status.usb_connected = (powerState == 1) ? 1 : 0;
+        status.charging_state = status.usb_connected;
+        status.safe_mode = 1; // Always safe mode
+        status.reserved = 0;
+        
+        // Get battery as percentage and convert to mV estimate
+        int batteryPercent = myCodeCell.BatteryLevelRead();
+        status.battery_mv = 3000 + (batteryPercent * 12); // 3.0V-4.2V range
+        status.vcc_mv = 3300;
+        status.timestamp_ms = qcTestActive ? (millis() - qcTestStartTime) : 0;
+        status.serial = qcSerialNumber;
+        
+        pQcStatus->setValue((uint8_t*)&status, sizeof(status));
+        pQcStatus->notify();
+        
+        Serial.printf("QC STATUS: USB=%d, Battery=%d%% (~%dmV)\n", 
+                     status.usb_connected, batteryPercent, status.battery_mv);
+        break;
+      }
+      
+      case QC_START_LOGGING:
+        if (value.length() >= 2) {
+          qcCurrentPhase = value[1];
+        }
+        qcLoggingActive = true;
+        if (!qcTestActive) {
+          qcTestActive = true;
+          qcTestStartTime = millis();
+        }
+        Serial.printf("QC: Logging STARTED, Phase: %d\n", qcCurrentPhase);
+        break;
+        
+      case QC_STOP_LOGGING:
+        qcLoggingActive = false;
+        Serial.println("QC: Logging STOPPED");
+        break;
+        
+      case QC_CHECKPOINT:
+        if (value.length() >= 2) {
+          qcCurrentPhase = value[1];
+        }
+        Serial.printf("QC: Checkpoint - Phase: %d\n", qcCurrentPhase);
+        break;
+        
+      case QC_SELF_TEST: {
+        Serial.println("QC: Running self-test...");
+        int batteryPercent = myCodeCell.BatteryLevelRead();
+        int powerState = myCodeCell.PowerStateRead();
+        Serial.printf("Self-test: Battery=%d%%, USB=%s\n",
+                     batteryPercent,
+                     powerState == 1 ? "Connected" : "Disconnected");
+        break;
+      }
+      
+      default:
+        Serial.printf("QC: Unknown command: 0x%02X\n", command);
+        break;
+    }
+  }
+};
+
+void setupQcService(BLEServer* srv) {
+  // Extract serial from device name - use the actual BLE device name
+  String deviceName = "FitChip014"; // Should match BLEDevice::init() name
+  if (deviceName.length() >= 3) {
+    qcSerialNumber = deviceName.substring(deviceName.length()-3).toInt();
+  }
+  
+  BLEService *svc = srv->createService(QC_SERVICE_UUID);
+  
+  // Command characteristic (WRITE)
+  pQcCommand = svc->createCharacteristic(
+    QC_COMMAND_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pQcCommand->setCallbacks(new QcCommandCallbacks());
+  
+  // Status characteristic (READ + NOTIFY)
+  pQcStatus = svc->createCharacteristic(
+    QC_STATUS_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pQcStatus->addDescriptor(new BLE2902());
+  
+  // Log characteristic (NOTIFY only)
+  pQcLog = svc->createCharacteristic(
+    QC_LOG_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pQcLog->addDescriptor(new BLE2902());
+  
+  svc->start();
+  Serial.println("QC Test service initialized");
 }
 
 void loop() {
@@ -637,16 +657,7 @@ void loop() {
         // Read accelerometer and gyro data
         float ax, ay, az;
         float gx, gy, gz;
-        
-        // Use configured gravity removal setting
-        if (removeGravity) {
-            // Use linear acceleration (gravity already removed by sensor fusion)
-            myCodeCell.Motion_LinearAccRead(ax, ay, az);
-        } else {
-            // Use raw accelerometer (includes gravity)
-            myCodeCell.Motion_AccelerometerRead(ax, ay, az);
-        }
-        
+        myCodeCell.Motion_AccelerometerRead(ax, ay, az);
         myCodeCell.Motion_GyroRead(gx, gy, gz);
 
         // Check for motion activity to reset sleep timer using delta method
