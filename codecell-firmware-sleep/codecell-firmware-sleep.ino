@@ -9,39 +9,26 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include "esp_ota_ops.h"
-#include "esp_system.h"
 #include <cmath>
 #include <string>
+#include "ota_library.h"
 
 CodeCell myCodeCell;
 
 // Forward declarations
-void setupOtaService(BLEServer* srv);
+// OTA functionality now handled by ota_library
 
-// Helper functions for safe little-endian parsing on RISC-V
-static inline uint16_t le16(const uint8_t* p){ return (uint16_t)p[0] | (uint16_t)p[1]<<8; }
-static inline uint32_t le32(const uint8_t* p){ return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
-static inline void put_le32(uint8_t* d, uint32_t v){ 
-  d[0]=v&0xFF; d[1]=(v>>8)&0xFF; d[2]=(v>>16)&0xFF; d[3]=(v>>24)&0xFF; 
-}
-
-// RTC memory to survive deep sleep
+// RTC memory to survive light sleep (deep sleep removed due to BNO085 issues)
 RTC_DATA_ATTR bool sensorInitialized = false;
+RTC_DATA_ATTR uint32_t bootCount = 0;
+RTC_DATA_ATTR uint32_t lastResetReason = 0;
 
 // BLE UUIDs (matching MicroLink for compatibility)
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "dcba4330-dcba-4321-dcba-432123456791"
 #define CONFIG_CHAR_UUID    "dcba4330-dcba-4321-dcba-432123456792"  // Configuration characteristic
 
-// BLE OTA Service UUIDs
-#define OTA_SERVICE_UUID   "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0001"
-#define OTA_CONTROL_UUID   "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0002"
-#define OTA_DATA_UUID      "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0003"
-
-// OTA Control opcodes
-enum { OP_START=0x01, OP_DATA=0x02, OP_FINISH=0x03, OP_REBOOT=0x04 };
-enum { OP_ACK_START=0xA1, OP_ACK_FINISH=0xA2, OP_PROGRESS=0x91, OP_ERROR=0xE0 };
+// OTA functionality moved to ota_library.h/.cpp
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
@@ -49,16 +36,14 @@ BLECharacteristic* pConfigCharacteristic = NULL;  // Config characteristic
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
-// OTA BLE characteristics
-static BLECharacteristic *pOtaCtrl = nullptr, *pOtaData = nullptr;
+// OTA instance - isolated from main firmware
+CodeCellOTA otaManager;
 
-// OTA state variables
-static const uint16_t DEFAULT_PROPOSED_CHUNK = 200;
-static uint16_t agreedChunk = 200;
-static const esp_partition_t *update_part = nullptr;
-static esp_ota_handle_t ota_handle = 0;
-static uint32_t total_len = 0, rx_len = 0, host_crc = 0;
-static bool ota_active = false;
+// Power loss recovery and BLE state management
+bool bleInitialized = false;
+bool sensorsReady = false;
+unsigned long lastBleCheck = 0;
+unsigned long startupTime = 0;
 
 // Power management configuration
 int dataRate = 60; // 60Hz for normal operation - configurable via BLE
@@ -89,7 +74,6 @@ enum ConfigCommands {
 // Even with RST pin tied to 3.3V, the sensor loses all configuration during ESP32 deep sleep
 // and cannot be reinitialized, returning only zeros. Light sleep preserves sensor state.
 unsigned long lastMotionTime = 0;
-unsigned long lastBleCheck = 0;
 unsigned long lastSleepCheck = 0;
 bool bleActive = true;
 bool sensorsActive = true;
@@ -106,110 +90,7 @@ float lastDetectedDelta = 0.0;
 bool isUsbPowered = false;
 unsigned long lastPowerCheck = 0;
 
-// ==== BLE OTA Implementation ====
-static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
-  crc = ~crc;
-  for (size_t i=0;i<len;i++) {
-    crc ^= data[i];
-    for (int k=0;k<8;k++) crc = (crc>>1) ^ (0xEDB88320 & (-(int)(crc & 1)));
-  }
-  return ~crc;
-}
-
-class OtaControlCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* c) override {
-    String arduinoString = c->getValue();
-    std::string s(arduinoString.c_str(), arduinoString.length());  // Convert properly
-    if (s.size() == 0) return;
-    const uint8_t *buf = (const uint8_t*)s.data();
-    uint8_t op = buf[0];
-
-    if (op == OP_START && s.size() >= (1+4+4+2)) {  // Change to .size()
-      if (ota_active) return;
-      total_len = le32(&buf[1]);
-      host_crc  = le32(&buf[5]);
-      uint16_t proposed = le16(&buf[9]);
-
-      update_part = esp_ota_get_next_update_partition(NULL);
-      if (!update_part) { notifyError(1); return; }
-      if (esp_ota_begin(update_part, total_len, &ota_handle) != ESP_OK) { notifyError(2); return; }
-
-      rx_len = 0; ota_active = true;
-      agreedChunk = (proposed >= 20 && proposed <= 200) ? proposed : 200; // safer cap
-
-      Serial.printf("OTA START: %u bytes, chunk size: %u\n", total_len, agreedChunk);
-
-      uint8_t ack[3] = { OP_ACK_START, (uint8_t)(agreedChunk & 0xFF), (uint8_t)(agreedChunk >> 8) };
-      pOtaCtrl->setValue(ack, sizeof(ack)); pOtaCtrl->notify();
-
-    } else if (op == OP_FINISH) {
-      if (!ota_active) return;
-      
-      // Skip CRC check for now - trust the flash write and BLE reliability
-      if (rx_len != total_len) { 
-        Serial.printf("OTA FINISH ERROR: len %u/%u (skipping CRC check)\n", rx_len, total_len);
-        notifyError(3); return; 
-      }
-      
-      Serial.printf("OTA FINISH: %u bytes received, CRC check skipped\n", rx_len);
-      
-      if (esp_ota_end(ota_handle) != ESP_OK) { notifyError(4); return; }
-      if (esp_ota_set_boot_partition(update_part) != ESP_OK) { notifyError(5); return; }
-      
-      Serial.println("OTA COMPLETE - ready to reboot");
-      uint8_t ack = OP_ACK_FINISH; pOtaCtrl->setValue(&ack,1); pOtaCtrl->notify();
-      ota_active = false;
-
-    } else if (op == OP_REBOOT) {
-      Serial.println("OTA REBOOT requested");
-      delay(50); esp_restart();
-    }
-  }
-  
-  static void notifyError(uint8_t code){
-    Serial.printf("OTA ERROR: %u\n", code);
-    uint8_t e[2] = { OP_ERROR, code };
-    pOtaCtrl->setValue(e, sizeof(e)); pOtaCtrl->notify();
-  }
-};
-
-class OtaDataCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* c) override {
-    if (!ota_active) return;
-    String arduinoString = c->getValue();
-    std::string s(arduinoString.c_str(), arduinoString.length());  // Convert properly
-    if (s.size() < 1+4) return;
-    const uint8_t *buf = (const uint8_t*)s.data();
-    if (buf[0] != OP_DATA) return;
-    uint32_t offset = le32(&buf[1]);
-    const uint8_t *payload = &buf[5];
-    size_t plen = s.size()-5;      // Change to .size()
-
-    // Write chunk to flash at the specified offset
-    if (esp_ota_write_with_offset(ota_handle, payload, plen, offset) != ESP_OK) {
-      Serial.printf("OTA WRITE ERROR at offset %u\n", offset);
-      uint8_t e[2] = { OP_ERROR, 7 }; pOtaCtrl->setValue(e,2); pOtaCtrl->notify();
-      return;
-    }
-    
-    // Update received bytes count (track highest offset + length)
-    uint32_t chunk_end = offset + plen;
-    if (chunk_end > rx_len) {
-      rx_len = chunk_end;
-    }
-    Serial.printf("OTA DATA: Wrote %u bytes at offset %u, total progress: %u/%u\n", plen, offset, rx_len, total_len);
-
-    if ((rx_len & 0x3FFF) == 0 || rx_len == total_len) {
-      uint8_t prog[1+4+4]; 
-      prog[0] = OP_PROGRESS;
-      put_le32(&prog[1], rx_len);    // Use helper instead of *(uint32_t*)
-      put_le32(&prog[5], total_len); // Use helper instead of *(uint32_t*)
-      pOtaCtrl->setValue(prog, sizeof(prog)); 
-      pOtaCtrl->notify();
-      Serial.printf("OTA PROGRESS: %u/%u bytes\n", rx_len, total_len);
-    }
-  }
-};
+// OTA implementation moved to ota_library.h/.cpp
 
 // Callback for handling configuration writes
 class ConfigCallbacks: public BLECharacteristicCallbacks {
@@ -316,6 +197,111 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
+// Robust BLE initialization with recovery logic
+bool initializeBLE() {
+    Serial.println("Initializing BLE system...");
+    
+    try {
+        // Initialize BLE device
+        BLEDevice::init("FitChip015");
+        
+        // Create server with callbacks
+        pServer = BLEDevice::createServer();
+        if (!pServer) {
+            Serial.println("ERROR: Failed to create BLE server");
+            return false;
+        }
+        pServer->setCallbacks(new MyServerCallbacks());
+
+        // Create main service
+        BLEService *pService = pServer->createService(SERVICE_UUID);
+        if (!pService) {
+            Serial.println("ERROR: Failed to create main BLE service");
+            return false;
+        }
+        
+        // Create data characteristic
+        pCharacteristic = pService->createCharacteristic(
+                          CHARACTERISTIC_UUID,
+                          BLECharacteristic::PROPERTY_READ |
+                          BLECharacteristic::PROPERTY_NOTIFY
+                        );
+        if (!pCharacteristic) {
+            Serial.println("ERROR: Failed to create data characteristic");
+            return false;
+        }
+        pCharacteristic->addDescriptor(new BLE2902());
+        
+        // Create configuration characteristic
+        pConfigCharacteristic = pService->createCharacteristic(
+                              CONFIG_CHAR_UUID,
+                              BLECharacteristic::PROPERTY_READ |
+                              BLECharacteristic::PROPERTY_WRITE |
+                              BLECharacteristic::PROPERTY_NOTIFY
+                            );
+        if (!pConfigCharacteristic) {
+            Serial.println("ERROR: Failed to create config characteristic");
+            return false;
+        }
+        pConfigCharacteristic->setCallbacks(new ConfigCallbacks());
+        pConfigCharacteristic->addDescriptor(new BLE2902());
+        
+        // Set initial config values
+        uint8_t initialConfig[5] = {CMD_GET_CONFIG, removeGravity, (uint8_t)dataRate, (uint8_t)(bleInactivityTimeout / 1000), 0};
+        pConfigCharacteristic->setValue(initialConfig, 5);
+        
+        // Start the service
+        pService->start();
+        
+        // Initialize OTA service
+        if (!otaManager.init(pServer)) {
+            Serial.println("WARNING: OTA service initialization failed - continuing without OTA");
+        }
+
+        // Setup advertising
+        BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+        if (!pAdvertising) {
+            Serial.println("ERROR: Failed to get BLE advertising");
+            return false;
+        }
+        
+        pAdvertising->addServiceUUID(SERVICE_UUID);
+        pAdvertising->addServiceUUID("8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0001"); // OTA service
+        pAdvertising->setScanResponse(false);
+        pAdvertising->setMinPreferred(0x0);
+        
+        // Start advertising with error handling
+        BLEDevice::startAdvertising();
+        
+        Serial.println("BLE initialization completed successfully");
+        return true;
+        
+    } catch (const std::exception& e) {
+        Serial.printf("BLE initialization exception: %s\n", e.what());
+        return false;
+    } catch (...) {
+        Serial.println("BLE initialization failed with unknown exception");
+        return false;
+    }
+}
+
+// Function to recover BLE after power issues
+bool recoverBLE() {
+    Serial.println("Attempting BLE recovery...");
+    
+    // Clean up existing BLE state
+    if (pServer && pServer->getAdvertising()->isAdvertising()) {
+        pServer->getAdvertising()->stop();
+        delay(100);
+    }
+    
+    // Deinitialize and reinitialize
+    BLEDevice::deinit(false);
+    delay(500);
+    
+    return initializeBLE();
+}
+
 // Function to check if there's significant motion by comparing acceleration changes
 bool checkMotionActivity() {
     float ax, ay, az;
@@ -360,207 +346,148 @@ bool checkMotionActivity() {
 
 void setup() {
     Serial.begin(115200);
-    delay(1000); // Longer delay for Serial to initialize
+    delay(1000);
     
     Serial.println("=================================");
-    Serial.println("CodeCell Sleep Mode Firmware Starting...");
+    Serial.println("CodeCell Sleep Mode Firmware v2.0");
+    Serial.println("Power Management & Recovery Enhanced");
     Serial.println("=================================");
     
-    // Check wake-up cause to determine initialization strategy
+    // Track boot count and initialization state
+    bootCount++;
+    startupTime = millis();
+    
+    // Power management: NO DEEP SLEEP due to BNO085 compatibility issues
+    Serial.printf("Boot #%d - Initializing system...\n", bootCount);
+    
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-        Serial.println("Waking from deep sleep - sensor should still be initialized");
-        // DON'T reinitialize - BNO085 is still powered and running
-        
-        // Just do a quick motion check without reinitialization
-        delay(500); // Brief stabilization
-        
-        float baselineAx, baselineAy, baselineAz;
-        myCodeCell.Motion_AccelerometerRead(baselineAx, baselineAy, baselineAz);
-        Serial.printf("Wake-up baseline: [%.3f, %.3f, %.3f]\n", baselineAx, baselineAy, baselineAz);
-        
-        bool motionDetected = false;
-        for (int i = 0; i < 5; i++) {
-            delay(200);
-            myCodeCell.Run(1); // Update sensor data
-            
-            float ax, ay, az;
-            myCodeCell.Motion_AccelerometerRead(ax, ay, az);
-            
-            float deltaAx = fabsf(ax - baselineAx);  // Change from abs() to fabsf()
-            float deltaAy = fabsf(ay - baselineAy);  // Change from abs() to fabsf()
-            float deltaAz = fabsf(az - baselineAz);  // Change from abs() to fabsf()
-            float totalDelta = sqrt(deltaAx*deltaAx + deltaAy*deltaAy + deltaAz*deltaAz);
-            
-            Serial.printf("Wake check %d: delta %.3f (threshold %.3f)\n", i+1, totalDelta, motionThreshold);
-            
-            if (totalDelta > motionThreshold) {
-                motionDetected = true;
-                Serial.println("Motion detected during wake-up check!");
-                break;
-            }
-        }
-        
-        if (!motionDetected) {
-            Serial.println("No motion detected - going back to sleep");
-            Serial.flush();
-            esp_sleep_enable_timer_wakeup(1000000); // 1 second
-            esp_deep_sleep_start();
-        }
-        
-        Serial.println("Motion detected - staying awake");
-        // Sensor is already initialized, skip to BLE setup
-        goto ble_init;
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
+        Serial.println("Fresh boot - full initialization required");
+        sensorInitialized = false;
     } else {
-        Serial.println("Normal startup (power-on or reset)");
-        sensorInitialized = false; // Reset flag on fresh boot
+        Serial.println("Wake from light sleep - checking sensor state");
     }
     
-    {
-        Serial.println("CodeCell BLE Quaternion Streamer with Sleep Mode");
+    // Initialize sensors with robust error handling
+    Serial.println("Initializing motion sensors...");
+    delay(2000);
+    
+    bool sensorsOK = false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        Serial.printf("Sensor initialization attempt %d/3...\n", attempt);
         
-        // Initialize sensors - try full suite first, fallback to accelerometer only
-        Serial.println("Initializing motion sensors...");
-        
-        // Give sensors time to stabilize after any wake-up
-        Serial.println("Sensor stabilization delay...");
-        delay(3000);
-        
-        // Try full sensor initialization first including linear acceleration for gravity removal
-        Serial.println("Attempting full sensor suite initialization...");
         myCodeCell.Init(MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_ROTATION + MOTION_MAGNETOMETER + MOTION_LINEAR_ACC + MOTION_GRAVITY);
-        
-        // Test if full sensors work
         delay(1000);
+        
         float testAx, testAy, testAz;
         float testQr, testQi, testQj, testQk;
         myCodeCell.Motion_AccelerometerRead(testAx, testAy, testAz);
         myCodeCell.Motion_RotationVectorRead(testQr, testQi, testQj, testQk);
         
-        // Check if accelerometer is working (it clearly is based on output)
         bool accelWorking = (testAx != 0.0 || testAy != 0.0 || testAz != 0.0);
         
-        Serial.printf("Sensor test results: Accel=[%.3f, %.3f, %.3f], Quat=[%.3f, %.3f, %.3f, %.3f]\n", 
+        Serial.printf("Sensor test: Accel=[%.3f, %.3f, %.3f], Quat=[%.3f, %.3f, %.3f, %.3f]\n", 
                       testAx, testAy, testAz, testQr, testQi, testQj, testQk);
         
-        // Accept initialization if accelerometer is working (quaternion may need more time)
-        bool fullSensorsWorking = accelWorking;
-        
-        if (fullSensorsWorking) {
-            Serial.println("Full sensor suite initialized successfully");
+        if (accelWorking) {
+            Serial.println("Sensors initialized successfully");
+            sensorsOK = true;
             sensorInitialized = true;
+            sensorsReady = true;
+            break;
         } else {
-            Serial.println("Full sensors failed - falling back to accelerometer only");
-            delay(1000);
-            myCodeCell.Init(MOTION_ACCELEROMETER);
-            delay(1000);
-            myCodeCell.Motion_AccelerometerRead(testAx, testAy, testAz);
-            if (testAx != 0.0 || testAy != 0.0 || testAz != 0.0) {
-                Serial.println("Accelerometer fallback successful");
-                sensorInitialized = true;
-            } else {
-                Serial.println("WARNING: Even accelerometer failed to initialize");
+            Serial.printf("Sensor initialization failed (attempt %d)\n", attempt);
+            if (attempt < 3) {
+                delay(2000);
             }
         }
     }
-
-ble_init:
     
-    // Give sensors more time to initialize and stabilize
-    delay(1000);
-    Serial.println("Sensors ready, initializing BLE...");
+    if (!sensorsOK) {
+        Serial.println("CRITICAL: Sensor initialization failed after 3 attempts");
+        Serial.println("System will continue but may have limited functionality");
+    }
     
-    // Initialize BLE
-    BLEDevice::init("FitChip011");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-
-    BLEService *pService = pServer->createService(SERVICE_UUID);
-    pCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ |
-                      BLECharacteristic::PROPERTY_NOTIFY
-                    );
-    pCharacteristic->addDescriptor(new BLE2902());
+    // Initialize BLE with retry logic
+    Serial.println("Initializing BLE system...");
     
-    // Create configuration characteristic (read/write/notify)
-    pConfigCharacteristic = pService->createCharacteristic(
-                          CONFIG_CHAR_UUID,
-                          BLECharacteristic::PROPERTY_READ |
-                          BLECharacteristic::PROPERTY_WRITE |
-                          BLECharacteristic::PROPERTY_NOTIFY
-                        );
-    pConfigCharacteristic->setCallbacks(new ConfigCallbacks());
-    pConfigCharacteristic->addDescriptor(new BLE2902());
+    int bleAttempts = 0;
+    while (!bleInitialized && bleAttempts < 3) {
+        bleAttempts++;
+        Serial.printf("BLE initialization attempt %d/3...\n", bleAttempts);
+        
+        if (initializeBLE()) {
+            bleInitialized = true;
+            Serial.println("BLE system ready");
+            break;
+        } else {
+            Serial.printf("BLE initialization failed (attempt %d)\n", bleAttempts);
+            if (bleAttempts < 3) {
+                delay(2000);
+            }
+        }
+    }
     
-    // Set initial config values
-    uint8_t initialConfig[5] = {CMD_GET_CONFIG, removeGravity, (uint8_t)dataRate, (uint8_t)(bleInactivityTimeout / 1000), 0};
-    pConfigCharacteristic->setValue(initialConfig, 5);
+    if (!bleInitialized) {
+        Serial.println("CRITICAL: BLE initialization failed after 3 attempts");
+        Serial.println("Device will not be discoverable - manual reset required");
+    }
     
-    pService->start();
+    // Final setup
+    lastMotionTime = millis();
+    lastBleCheck = millis();
+    lastPowerCheck = millis();
     
-    // Add OTA service
-    setupOtaService(pServer);
-
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->addServiceUUID(OTA_SERVICE_UUID);
-    pAdvertising->setScanResponse(false);
-    pAdvertising->setMinPreferred(0x0);
-    BLEDevice::startAdvertising();
-
-    Serial.println("Ready for computer GUI connection...");
+    systemInitialized = true;
+    
+    Serial.println("=================================");
+    Serial.printf("Initialization complete in %lums\n", millis() - startupTime);
+    Serial.printf("Sensors: %s | BLE: %s\n", 
+                  sensorsReady ? "OK" : "FAILED", 
+                  bleInitialized ? "OK" : "FAILED");
     Serial.println("Configuration commands available via BLE:");
     Serial.println("  - CMD_SET_GRAVITY (0x01): Toggle gravity removal");
     Serial.println("  - CMD_SET_DATA_RATE (0x02): Set polling rate (10-100 Hz)");
     Serial.println("  - CMD_SET_SLEEP_TIMEOUT (0x03): Set sleep timeout (5-255 seconds)");
     Serial.println("  - CMD_GET_CONFIG (0x04): Get current configuration");
-    lastMotionTime = millis();
-    lastBleCheck = millis();
-    
-    // Mark system as fully initialized - safe for configuration
-    systemInitialized = true;
-    Serial.println("System initialization complete - configuration enabled");
+    Serial.println("=================================");
 }
 
-// ==== OTA Service Setup Function ====
-void setupOtaService(BLEServer* srv) {
-  BLEService *svc = srv->createService(OTA_SERVICE_UUID);
-
-  pOtaCtrl = svc->createCharacteristic(
-    OTA_CONTROL_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pOtaCtrl->addDescriptor(new BLE2902());  // Add CCCD for notifications
-  pOtaCtrl->setCallbacks(new OtaControlCallbacks());
-
-  pOtaData = svc->createCharacteristic(
-    OTA_DATA_UUID,
-    BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_WRITE  // Add WRITE for fallback
-  );
-  pOtaData->setCallbacks(new OtaDataCallbacks());
-
-  svc->start();
-  Serial.println("OTA service initialized");
-}
+// OTA service setup moved to ota_library.h/.cpp
 
 void loop() {
-    // Multi-tier power management
     unsigned long currentTime = millis();
+    
+    // Check for BLE recovery needs
+    if (bleInitialized && currentTime - lastBleCheck > 10000) {
+        lastBleCheck = currentTime;
+        
+        // Verify BLE is still functional
+        if (!pServer || !pServer->getAdvertising()) {
+            Serial.println("BLE system appears corrupted - attempting recovery");
+            if (recoverBLE()) {
+                Serial.println("BLE recovery successful");
+            } else {
+                Serial.println("BLE recovery failed - continuing without BLE");
+                bleInitialized = false;
+            }
+        }
+    }
     
     // Check USB power status every 5 seconds
     if (currentTime - lastPowerCheck > 5000) {
         lastPowerCheck = currentTime;
         int powerState = myCodeCell.PowerStateRead();
-        isUsbPowered = (powerState == 1); // 1 = Running from USB Power
+        isUsbPowered = (powerState == 1);
         
         if (isUsbPowered) {
             Serial.println("USB powered - maintaining 60Hz operation");
         }
     }
     
-    if (currentTime - lastBleCheck > 1000) { // Check every second
+    // Power management state machine
+    if (currentTime - lastSleepCheck > 1000) {
+        lastSleepCheck = currentTime;
         lastBleCheck = currentTime;
         unsigned long timeSinceMotion = currentTime - lastMotionTime;
         
@@ -573,7 +500,7 @@ void loop() {
                 dataRate = 60; // Restore full data rate
                 imuRate = 60; // Restore full IMU rate
                 bleActive = true;
-                if (!pServer->getAdvertising()->isAdvertising()) {
+                if (bleInitialized && pServer && !pServer->getAdvertising()->isAdvertising()) {
                     pServer->getAdvertising()->start();
                 }
                 currentPowerState = ACTIVE;
@@ -583,12 +510,14 @@ void loop() {
             // State machine for power management (battery only)
             switch (currentPowerState) {
             case ACTIVE:
-                if (!ota_active && timeSinceMotion > bleInactivityTimeout) {
+                if (!otaManager.isActive() && timeSinceMotion > bleInactivityTimeout) {
                     Serial.printf("Entering BLE_OFF state (1Hz mode) after %lums\n", timeSinceMotion);
                     dataRate = lowPowerDataRate; // Reduce to 1Hz transmission
                     imuRate = lowPowerImuRate; // Reduce IMU polling to 10Hz
                     bleActive = false; // Actually turn off BLE notifications
-                    pServer->getAdvertising()->stop(); // Stop advertising
+                    if (bleInitialized && pServer) {
+                        pServer->getAdvertising()->stop();
+                    }
                     Serial.println("BLE_OFF: BLE disabled, IMU polling at 10Hz");
                     currentPowerState = BLE_OFF;
                 }
@@ -600,9 +529,11 @@ void loop() {
                     dataRate = 60; // Restore full data rate
                     imuRate = 60; // Restore full IMU rate
                     bleActive = true; // Re-enable BLE
-                    pServer->getAdvertising()->start(); // Restart advertising
+                    if (bleInitialized && pServer) {
+                        pServer->getAdvertising()->start();
+                    }
                     currentPowerState = ACTIVE;
-                } else if (!ota_active && timeSinceMotion > lightSleepTimeout) {
+                } else if (!otaManager.isActive() && timeSinceMotion > lightSleepTimeout) {
                     Serial.printf("Entering LIGHT_SLEEP state after %lums\n", timeSinceMotion);
                     Serial.println("LIGHT_SLEEP: Sensors active, CPU reduced to 80MHz, BLE off, IMU at 5Hz");
                     imuRate = 5; // Reduce to 5Hz for maximum power savings in light sleep
@@ -627,9 +558,8 @@ void loop() {
         }
     }
     
-    // Run sensor readings - deep sleep removed due to BNO085 compatibility issues
-    
-    if (myCodeCell.Run(imuRate)) {
+    // Sensor processing with recovery
+    if (sensorsReady && myCodeCell.Run(imuRate)) {
         // Read quaternion data directly from BNO085 (no gimbal lock!)
         float qr, qi, qj, qk;
         myCodeCell.Motion_RotationVectorRead(qr, qi, qj, qk);
@@ -750,13 +680,11 @@ void loop() {
         Serial.printf("Time since motion: %lums | BLE: %s\n", 
                      timeSinceLastMotion, deviceConnected ? "Connected" : "Disconnected");
 
-        // Send minimal quaternion data via BLE (19 bytes - same as Euler!)
-        // Throttle IMU streaming during OTA to avoid congestion
-        if (deviceConnected && bleActive && !ota_active) {
+        // Send data via BLE with error handling
+        if (bleInitialized && deviceConnected && bleActive && !otaManager.isActive()) {
             pCharacteristic->setValue(binaryData, 19);
             pCharacteristic->notify();
-        } else if (ota_active) {
-            // During OTA, reduce IMU notifications to prevent BLE congestion
+        } else if (otaManager.isActive()) {
             static unsigned long lastOtaThrottleLog = 0;
             if (currentTime - lastOtaThrottleLog > 5000) {
                 Serial.println("IMU streaming throttled during OTA");
@@ -766,20 +694,24 @@ void loop() {
     }
     // End of sensor reading block
 
-    // Handle disconnection and restart advertising ONLY if BLE is supposed to be active
-    if (!deviceConnected && oldDeviceConnected) {
-        if (bleActive && currentPowerState == ACTIVE) {
-            delay(500);
-            pServer->startAdvertising();
-            Serial.println("Restarted advertising for reconnection");
-        } else {
-            Serial.println("Device disconnected but BLE is off - not restarting advertising");
+    // Handle BLE connection management with recovery
+    if (bleInitialized) {
+        if (!deviceConnected && oldDeviceConnected) {
+            if (bleActive && currentPowerState == ACTIVE) {
+                delay(500);
+                if (pServer) {
+                    pServer->startAdvertising();
+                    Serial.println("Restarted advertising for reconnection");
+                }
+            } else {
+                Serial.println("Device disconnected but BLE is off - not restarting advertising");
+            }
+            oldDeviceConnected = deviceConnected;
         }
-        oldDeviceConnected = deviceConnected;
-    }
 
-    if (deviceConnected && !oldDeviceConnected) {
-        oldDeviceConnected = deviceConnected;
-        Serial.println("New connection established");
+        if (deviceConnected && !oldDeviceConnected) {
+            oldDeviceConnected = deviceConnected;
+            Serial.println("New connection established");
+        }
     }
 }
