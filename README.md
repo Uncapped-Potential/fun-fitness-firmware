@@ -1,15 +1,24 @@
 # Fun Fitness Firmware
 
-ESP32 firmware for the Fun Fitness wireless game controller with motion tracking and battery monitoring.
+Production-ready ESP32-C3 firmware for the Fun Fitness wireless game controller with high-performance motion tracking and OTA update support.
+
+## 🚀 Production Firmware
+
+**Main firmware location**: [`codecell-firmware-minimal/`](./codecell-firmware-minimal/)
+
+This is the production-ready firmware with:
+- **60Hz Performance** - A:60Hz G:60Hz Q:20-40Hz BLE:60Hz streaming
+- **Modular Architecture** - Clean separation with IMU manager and OTA worker
+- **OTA Ready** - Complete over-the-air update implementation
+- **Real Battery Status** - Proper USB/charging detection for OTA authorization
 
 ## Features
 
 - **9-axis IMU** - Real-time motion tracking (accelerometer, gyroscope, rotation, magnetometer)
-- **BLE Communication** - 24Hz data streaming to web application (optimized for battery life)
-- **Binary Protocol** - Compact 19-byte format (77% smaller than text)
-- **Battery Monitoring** - Real-time battery level reporting and LED indicators
-- **Auto-reconnect** - Automatic BLE advertising restart on disconnect
-- **Power Management** - Sleep mode with motion-based wake (coming soon)
+- **BLE Communication** - 60Hz quaternion streaming with 19-byte binary protocol
+- **Motion Detection** - Configurable threshold with LED feedback
+- **Power Management** - Vendor-compliant sleep/wake with motion-based activation
+- **OTA Updates** - Queue-based firmware updates with CRC32 validation
 
 ## Hardware
 
@@ -17,6 +26,16 @@ ESP32 firmware for the Fun Fitness wireless game controller with motion tracking
 - **Sensors**: Built-in 9-axis IMU with magnetometer
 - **Communication**: Bluetooth Low Energy (BLE)
 - **Power**: Battery with USB charging
+
+## 📁 Repository Structure
+
+- **[`codecell-firmware-minimal/`](./codecell-firmware-minimal/)** - Production firmware (USE THIS)
+- **[`archive/`](./archive/)** - Previous firmware experiments and troubleshooting docs
+- **[`enclosure_3D_models/`](./enclosure_3D_models/)** - 3D printable enclosure files
+
+## 🏗️ Development History
+
+All previous firmware experiments have been archived to keep the repository clean. The current production firmware represents the culmination of extensive performance optimization and feature development, achieving reliable 60Hz streaming performance with proper power management.
 
 ## Bill of Materials (BOM)
 
