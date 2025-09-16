@@ -8,6 +8,7 @@
 
 #include "config.h"
 #include "imu_manager.h"
+#include "ota_worker.h"
 #include <CodeCell.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -16,6 +17,7 @@
 
 CodeCell myCodeCell;
 ImuManager imuManager;
+OtaWorker otaWorker;
 
 // Debug counters for rate monitoring
 static unsigned long blePacketsSent = 0;
@@ -24,6 +26,8 @@ static unsigned long lastDebugTime = 0;
 // BLE state
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
+BLECharacteristic* pOtaControlChar = NULL;
+BLECharacteristic* pOtaDataChar = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -40,6 +44,95 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
       Serial.println("BLE Client Disconnected");
+    }
+};
+
+// OTA Control Characteristic Callback
+class OtaControlCharCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) override {
+        String value = pCharacteristic->getValue();
+
+        if (value.length() > 0) {
+            const uint8_t* data = (const uint8_t*)value.c_str();
+            uint16_t length = value.length();
+
+            Serial.printf("OTA Control: Received %d bytes, command: 0x%02x\n", length, data[0]);
+
+            if (length >= 1) {
+                uint8_t command = data[0];
+
+                switch (command) {
+                    case 0x01: { // OP_START - [0x01][length_low][length_mid][length_high]
+                        if (length >= 4) {
+                            uint32_t totalSize = (data[3] << 16) | (data[2] << 8) | data[1];
+                            uint16_t chunkSize = OTA_CHUNK_SIZE;
+
+                            Serial.printf("OTA: START command, total size: %u bytes\n", totalSize);
+
+                            if (otaWorker.startOta(totalSize)) {
+                                // Send ack: [0xa1][chunk_size_low][chunk_size_high]
+                                uint8_t ack_response[3] = {
+                                    0xa1,
+                                    chunkSize & 0xFF,
+                                    (chunkSize >> 8) & 0xFF
+                                };
+
+                                pOtaControlChar->setValue(ack_response, 3);
+                                pOtaControlChar->notify();
+                                Serial.printf("OTA: Sent START ACK: 0xa1 with chunk size %d\n", chunkSize);
+                            } else {
+                                uint8_t error_response = 0xff;
+                                pOtaControlChar->setValue(&error_response, 1);
+                                pOtaControlChar->notify();
+                                Serial.println("OTA: Sent START ERROR: 0xff");
+                            }
+                        }
+                        break;
+                    }
+
+                    case 0x03: { // OP_FINISH - [0x03]
+                        Serial.println("OTA: FINISH command received");
+
+                        uint8_t finish_ack = 0xa2;
+                        pOtaControlChar->setValue(&finish_ack, 1);
+                        pOtaControlChar->notify();
+                        Serial.println("OTA: Sent FINISH ACK: 0xa2");
+                        break;
+                    }
+
+                    default: {
+                        Serial.printf("OTA: Unknown command: 0x%02x\n", command);
+                        uint8_t unknown_response = 0xff;
+                        pOtaControlChar->setValue(&unknown_response, 1);
+                        pOtaControlChar->notify();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+};
+
+// OTA Data Characteristic Callback
+class OtaDataCharCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) override {
+        String value = pCharacteristic->getValue();
+
+        if (value.length() > 0) {
+            const uint8_t* data = (const uint8_t*)value.c_str();
+            uint16_t length = value.length();
+
+            Serial.printf("OTA Data: Received %d bytes\n", length);
+
+            static uint32_t sequence = 0;
+            bool isLast = false; // Determined by total progress
+
+            if (otaWorker.queueChunk(data, length, sequence++, isLast)) {
+                Serial.printf("OTA Data: Chunk %u queued successfully\n", sequence - 1);
+            } else {
+                Serial.printf("OTA Data: Failed to queue chunk %u\n", sequence - 1);
+            }
+        }
     }
 };
 
@@ -103,6 +196,17 @@ void setup() {
         }
     }
 
+    // Initialize OTA worker
+    if (!otaWorker.init()) {
+        Serial.println("ERROR: OTA worker initialization failed!");
+        while (1) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(50);
+            digitalWrite(LED_PIN, LOW);
+            delay(50);
+        }
+    }
+
     // Initialize BLE
     Serial.println("Initializing BLE...");
     BLEDevice::init(DEVICE_NAME);
@@ -111,12 +215,31 @@ void setup() {
     pServer->setCallbacks(new MyServerCallbacks());
 
     BLEService *pService = pServer->createService(SERVICE_UUID);
+
+    // Quaternion data characteristic (existing)
     pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_READ |
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
     pCharacteristic->addDescriptor(new BLE2902());
+
+    // OTA Control characteristic (commands and acknowledgments)
+    pOtaControlChar = pService->createCharacteristic(
+                      OTA_CONTROL_CHAR_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+    pOtaControlChar->addDescriptor(new BLE2902());
+    pOtaControlChar->setCallbacks(new OtaControlCharCallbacks());
+
+    // OTA Data characteristic (firmware chunks)
+    pOtaDataChar = pService->createCharacteristic(
+                      OTA_DATA_CHAR_UUID,
+                      BLECharacteristic::PROPERTY_WRITE
+                    );
+    pOtaDataChar->setCallbacks(new OtaDataCharCallbacks());
 
     pService->start();
 
@@ -147,7 +270,7 @@ void loop() {
         if (deviceConnected) {
             uint8_t binaryData[19];
 
-            // Pack quaternion XYZ (W calculated by receiver)
+            // Pack quaternion XYZ (W calculated by receiver, sign in battery byte)
             int16_t qiInt = (int16_t)(qi * 10000);
             int16_t qjInt = (int16_t)(qj * 10000);
             int16_t qkInt = (int16_t)(qk * 10000);
@@ -170,9 +293,10 @@ void loop() {
             binaryData[12] = gxInt & 0xFF; binaryData[13] = (gxInt >> 8) & 0xFF;
             binaryData[14] = gyInt & 0xFF; binaryData[15] = (gyInt >> 8) & 0xFF;
             binaryData[16] = gzInt & 0xFF; binaryData[17] = (gzInt >> 8) & 0xFF;
-            // Read actual battery level using CodeCell library
+            // Read actual battery level and pack W sign in MSB
             uint8_t batteryLevel = myCodeCell.BatteryLevelRead();
-            binaryData[18] = batteryLevel; // 101=charging, 102=USB only, 1-100=battery %
+            uint8_t wSign = (qr >= 0) ? 0x80 : 0x00;  // Bit 7: 1=positive W, 0=negative W
+            binaryData[18] = (batteryLevel & 0x7F) | wSign; // Battery in bits 0-6, W sign in bit 7
 
             pCharacteristic->setValue(binaryData, 19);
             pCharacteristic->notify();
@@ -214,12 +338,21 @@ void loop() {
                              data.motionDelta, MOTION_THRESHOLD);
             }
 
+            // OTA status monitoring
+            if (otaWorker.isActive()) {
+                const OtaWorker::OtaStatus& otaStatus = otaWorker.getStatus();
+                Serial.printf("OTA: %u/%u chunks (%u/%u bytes) - State: %d\n",
+                             otaStatus.chunksReceived, otaStatus.expectedChunks,
+                             otaStatus.bytesReceived, otaStatus.totalSize,
+                             otaStatus.state);
+            }
+
             // Reset BLE counter for next measurement
             blePacketsSent = 0;
 
             // Check if we should sleep (following vendor pattern)
-            // Only sleep if not connected to BLE (maintain streaming when connected)
-            if (!imuManager.isMotionActive() && !deviceConnected) {
+            // Only sleep if not connected to BLE and no OTA in progress
+            if (!imuManager.isMotionActive() && !deviceConnected && !otaWorker.isActive()) {
                 Serial.println("No motion detected - entering sleep mode");
                 Serial.println("Using vendor myCodeCell.Sleep(1) - will wake in 1 second");
                 Serial.flush(); // Ensure output before sleep
