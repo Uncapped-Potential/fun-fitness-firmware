@@ -20,7 +20,7 @@ public:
     };
 
     struct OtaChunk {
-        uint32_t sequence;
+        uint32_t offset;
         uint32_t totalSize;
         uint16_t chunkSize;
         uint32_t crc32;
@@ -48,7 +48,7 @@ public:
     bool startOta(uint32_t totalSize);
 
     // Queue chunk for processing (call from BLE callback)
-    bool queueChunk(const uint8_t* data, uint16_t length, uint32_t sequence, bool isLast);
+    bool queueChunk(const uint8_t* data, uint16_t length, uint32_t offset, bool isLast);
 
     // Get current status
     const OtaStatus& getStatus() const { return status; }
@@ -74,7 +74,7 @@ private:
     bool initialized;
 
     // OTA session state
-    uint32_t nextExpectedSequence;
+    uint32_t nextExpectedOffset;
     uint32_t sessionStartTime;
 
     // Buffer for chunk assembly (if needed)

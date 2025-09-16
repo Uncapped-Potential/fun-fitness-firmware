@@ -14,6 +14,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <esp_ota_ops.h>
 
 CodeCell myCodeCell;
 ImuManager imuManager;
@@ -27,7 +28,6 @@ static unsigned long lastDebugTime = 0;
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 BLECharacteristic* pOtaControlChar = NULL;
-BLECharacteristic* pOtaDataChar = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -56,36 +56,66 @@ class OtaControlCharCallbacks: public BLECharacteristicCallbacks {
             const uint8_t* data = (const uint8_t*)value.c_str();
             uint16_t length = value.length();
 
-            Serial.printf("OTA Control: Received %d bytes, command: 0x%02x\n", length, data[0]);
+            Serial.printf("OTA Control: Received %d bytes, command: 0x%02x", length, data[0]);
+            // Print hex dump for debugging
+            Serial.print(" [");
+            for (int i = 0; i < length && i < 16; i++) {
+                Serial.printf("%02x", data[i]);
+                if (i < length - 1 && i < 15) Serial.print(" ");
+            }
+            if (length > 16) Serial.print("...");
+            Serial.println("]");
 
             if (length >= 1) {
                 uint8_t command = data[0];
 
                 switch (command) {
-                    case 0x01: { // OP_START - [0x01][length_low][length_mid][length_high]
-                        if (length >= 4) {
-                            uint32_t totalSize = (data[3] << 16) | (data[2] << 8) | data[1];
-                            uint16_t chunkSize = OTA_CHUNK_SIZE;
+                    case 0x01: { // OP_START - [0x01][length:4][crc32:4][chunk_size:2] (11 bytes total, little-endian)
+                        if (length >= 11) {
+                            // Parse little-endian fields
+                            uint32_t totalSize = data[1] | (data[2] << 8) | (data[3] << 16) | (data[4] << 24);
+                            uint32_t expectedCrc32 = data[5] | (data[6] << 8) | (data[7] << 16) | (data[8] << 24);
+                            uint16_t requestedChunkSize = data[9] | (data[10] << 8);
 
-                            Serial.printf("OTA: START command, total size: %u bytes\n", totalSize);
+                            Serial.printf("OTA: START command - Size: %u, CRC32: 0x%08x, Chunk: %u\n",
+                                         totalSize, expectedCrc32, requestedChunkSize);
 
                             if (otaWorker.startOta(totalSize)) {
-                                // Send ack: [0xa1][chunk_size_low][chunk_size_high]
-                                uint8_t ack_response[3] = {
-                                    0xa1,
-                                    chunkSize & 0xFF,
-                                    (chunkSize >> 8) & 0xFF
-                                };
-
-                                pOtaControlChar->setValue(ack_response, 3);
+                                // Send immediate ACK: [0xa1]
+                                uint8_t ack_response = 0xa1;
+                                pOtaControlChar->setValue(&ack_response, 1);
                                 pOtaControlChar->notify();
-                                Serial.printf("OTA: Sent START ACK: 0xa1 with chunk size %d\n", chunkSize);
+                                Serial.println("OTA: Sent START ACK: 0xa1");
                             } else {
                                 uint8_t error_response = 0xff;
                                 pOtaControlChar->setValue(&error_response, 1);
                                 pOtaControlChar->notify();
                                 Serial.println("OTA: Sent START ERROR: 0xff");
                             }
+                        } else {
+                            Serial.printf("OTA: START command too short (%d bytes, expected 11)\n", length);
+                            uint8_t error_response = 0xff;
+                            pOtaControlChar->setValue(&error_response, 1);
+                            pOtaControlChar->notify();
+                        }
+                        break;
+                    }
+
+                    case 0x02: { // OP_DATA - [0x02][offset:4][data...] (little-endian)
+                        if (length >= 5) {
+                            uint32_t offset = data[1] | (data[2] << 8) | (data[3] << 16) | (data[4] << 24);
+                            uint16_t dataLength = length - 5;
+                            const uint8_t* chunkData = &data[5];
+
+                            Serial.printf("OTA Data: Offset %u, Length %u\n", offset, dataLength);
+
+                            if (otaWorker.queueChunk(chunkData, dataLength, offset, false)) {
+                                Serial.printf("OTA Data: Chunk at offset %u queued successfully\n", offset);
+                            } else {
+                                Serial.printf("OTA Data: Failed to queue chunk at offset %u\n", offset);
+                            }
+                        } else {
+                            Serial.printf("OTA: DATA command too short (%d bytes, expected >=5)\n", length);
                         }
                         break;
                     }
@@ -113,28 +143,6 @@ class OtaControlCharCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
-// OTA Data Characteristic Callback
-class OtaDataCharCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* pCharacteristic) override {
-        String value = pCharacteristic->getValue();
-
-        if (value.length() > 0) {
-            const uint8_t* data = (const uint8_t*)value.c_str();
-            uint16_t length = value.length();
-
-            Serial.printf("OTA Data: Received %d bytes\n", length);
-
-            static uint32_t sequence = 0;
-            bool isLast = false; // Determined by total progress
-
-            if (otaWorker.queueChunk(data, length, sequence++, isLast)) {
-                Serial.printf("OTA Data: Chunk %u queued successfully\n", sequence - 1);
-            } else {
-                Serial.printf("OTA Data: Failed to queue chunk %u\n", sequence - 1);
-            }
-        }
-    }
-};
 
 void setup() {
     Serial.begin(115200);
@@ -144,6 +152,23 @@ void setup() {
     Serial.println("CodeCell Minimal Motion Detection");
     Serial.println("Phase 3: Adding BLE Streaming");
     Serial.println("=================================");
+
+    // Print partition information for OTA debugging
+    Serial.println("=== PARTITION INFO ===");
+    Serial.printf("Sketch size: %u bytes\n", ESP.getSketchSize());
+    Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+    Serial.printf("Flash chip size: %u bytes\n", ESP.getFlashChipSize());
+
+    // Check OTA partition size
+    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition) {
+        Serial.printf("OTA partition size: %u bytes\n", update_partition->size);
+        Serial.printf("OTA partition address: 0x%x\n", update_partition->address);
+    } else {
+        Serial.println("No OTA partition found!");
+    }
+
+    Serial.println("======================");
 
     // Setup LED
     pinMode(LED_PIN, OUTPUT);
@@ -234,12 +259,6 @@ void setup() {
     pOtaControlChar->addDescriptor(new BLE2902());
     pOtaControlChar->setCallbacks(new OtaControlCharCallbacks());
 
-    // OTA Data characteristic (firmware chunks)
-    pOtaDataChar = pService->createCharacteristic(
-                      OTA_DATA_CHAR_UUID,
-                      BLECharacteristic::PROPERTY_WRITE
-                    );
-    pOtaDataChar->setCallbacks(new OtaDataCharCallbacks());
 
     pService->start();
 
@@ -338,13 +357,19 @@ void loop() {
                              data.motionDelta, MOTION_THRESHOLD);
             }
 
-            // OTA status monitoring
+            // OTA status monitoring with detailed state info
             if (otaWorker.isActive()) {
                 const OtaWorker::OtaStatus& otaStatus = otaWorker.getStatus();
-                Serial.printf("OTA: %u/%u chunks (%u/%u bytes) - State: %d\n",
-                             otaStatus.chunksReceived, otaStatus.expectedChunks,
-                             otaStatus.bytesReceived, otaStatus.totalSize,
-                             otaStatus.state);
+                const char* stateNames[] = {"IDLE", "RECEIVING", "VALIDATING", "APPLYING", "SUCCESS", "ERROR"};
+                const char* stateName = (otaStatus.state < 6) ? stateNames[otaStatus.state] : "UNKNOWN";
+
+                Serial.printf("OTA: %s - %u chunks (%u/%u bytes)",
+                             stateName, otaStatus.chunksReceived, otaStatus.bytesReceived, otaStatus.totalSize);
+
+                if (otaStatus.state == 5) { // OTA_ERROR
+                    Serial.printf(" - ERROR: %s", otaStatus.errorMessage);
+                }
+                Serial.println();
             }
 
             // Reset BLE counter for next measurement

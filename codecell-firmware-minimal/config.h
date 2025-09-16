@@ -4,11 +4,10 @@
 // Device Configuration
 #define DEVICE_NAME         "FitChip011"
 
-// BLE Service UUIDs - Single Service with Multiple Characteristics
+// BLE Service UUIDs - Single Service with Quaternion + OTA Control
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "dcba4330-dcba-4321-dcba-432123456791"
 #define OTA_CONTROL_CHAR_UUID "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0002"
-#define OTA_DATA_CHAR_UUID    "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0003"
 
 // Sensor Performance Configuration
 #define UPDATE_RATE         60    // Hz - optimized for 60Hz performance
