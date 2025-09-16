@@ -1,10 +1,11 @@
 #include "ota_worker.h"
+#include <esp_ota_ops.h>
 
 OtaWorker::OtaWorker()
     : workerTaskHandle(nullptr)
     , chunkQueue(nullptr)
     , initialized(false)
-    , nextExpectedSequence(0)
+    , nextExpectedOffset(0)
     , sessionStartTime(0)
     , assemblyBuffer(nullptr)
     , assemblyBufferSize(0)
@@ -69,17 +70,35 @@ bool OtaWorker::startOta(uint32_t totalSize) {
 
     Serial.printf("Starting OTA session: %u bytes\n", totalSize);
 
+    // Check available OTA space
+    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition) {
+        Serial.printf("OTA: Available partition size: %u bytes\n", update_partition->size);
+        if (totalSize > update_partition->size) {
+            setError("Firmware too large for OTA partition");
+            Serial.printf("OTA ERROR: Requested %u bytes, but partition only has %u bytes\n",
+                         totalSize, update_partition->size);
+            return false;
+        }
+    } else {
+        setError("No OTA partition found");
+        return false;
+    }
+
     // Reset state for new session
     resetOtaState();
     status.state = OTA_RECEIVING;
     status.totalSize = totalSize;
     status.expectedChunks = (totalSize + OTA_CHUNK_SIZE - 1) / OTA_CHUNK_SIZE;
     sessionStartTime = millis();
-    nextExpectedSequence = 0;
+    nextExpectedOffset = 0;
 
     // Initialize ESP32 Update library
     if (!Update.begin(totalSize)) {
-        setError("Failed to begin update");
+        char errorStr[128];
+        snprintf(errorStr, sizeof(errorStr), "Update.begin() failed: %s", Update.errorString());
+        setError(errorStr);
+        Serial.printf("OTA ERROR: %s\n", errorStr);
         return false;
     }
 
@@ -88,7 +107,7 @@ bool OtaWorker::startOta(uint32_t totalSize) {
     return true;
 }
 
-bool OtaWorker::queueChunk(const uint8_t* data, uint16_t length, uint32_t sequence, bool isLast) {
+bool OtaWorker::queueChunk(const uint8_t* data, uint16_t length, uint32_t offset, bool isLast) {
     if (!initialized || !isActive()) {
         return false;
     }
@@ -105,9 +124,15 @@ bool OtaWorker::queueChunk(const uint8_t* data, uint16_t length, uint32_t sequen
         return false;
     }
 
+    // Validate offset
+    if (offset >= status.totalSize) {
+        setError("Chunk offset beyond file size");
+        return false;
+    }
+
     // Create chunk structure
     OtaChunk chunk;
-    chunk.sequence = sequence;
+    chunk.offset = offset;
     chunk.totalSize = status.totalSize;
     chunk.chunkSize = length;
     chunk.isLastChunk = isLast;
@@ -163,9 +188,9 @@ void OtaWorker::processChunk(const OtaChunk& chunk) {
         return; // Error already set by validateChunk
     }
 
-    // Check sequence order
-    if (chunk.sequence != nextExpectedSequence) {
-        setError("Chunk out of sequence");
+    // Check offset order (must be sequential for ESP32 Update library)
+    if (chunk.offset != nextExpectedOffset) {
+        setError("Chunk offset out of order");
         Update.abort();
         return;
     }
@@ -181,13 +206,13 @@ void OtaWorker::processChunk(const OtaChunk& chunk) {
     // Update progress
     status.bytesReceived += chunk.chunkSize;
     status.chunksReceived++;
-    nextExpectedSequence++;
+    nextExpectedOffset += chunk.chunkSize;
 
-    Serial.printf("OTA: Chunk %u/%u processed (%u bytes)\n",
-                 status.chunksReceived, status.expectedChunks, status.bytesReceived);
+    Serial.printf("OTA: Chunk at offset %u processed (%u/%u bytes)\n",
+                 chunk.offset, status.bytesReceived, status.totalSize);
 
-    // Check if this is the last chunk
-    if (chunk.isLastChunk || status.chunksReceived >= status.expectedChunks) {
+    // Check if this is the last chunk or we've received all data
+    if (chunk.isLastChunk || status.bytesReceived >= status.totalSize) {
         status.state = OTA_VALIDATING;
         Serial.println("OTA: All chunks received, validating...");
 

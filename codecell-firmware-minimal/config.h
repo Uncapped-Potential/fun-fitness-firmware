@@ -4,9 +4,10 @@
 // Device Configuration
 #define DEVICE_NAME         "FitChip011"
 
-// BLE Service UUIDs
+// BLE Service UUIDs - Single Service with Quaternion + OTA Control
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "dcba4330-dcba-4321-dcba-432123456791"
+#define OTA_CONTROL_CHAR_UUID "8f20d6c8-5f7d-4e7b-9b1c-0a701c3a0002"
 
 // Sensor Performance Configuration
 #define UPDATE_RATE         60    // Hz - optimized for 60Hz performance
@@ -23,5 +24,13 @@
 #define SENSOR_STABILIZATION_MS  3000  // Initialization delay
 #define MAIN_LOOP_DELAY_MS       1     // Minimal cooperative delay
 #define DEBUG_INTERVAL_MS        1000  // 1-second debug output
+
+// OTA Worker Configuration (Conservative Settings)
+#define OTA_CHUNK_SIZE          128     // Conservative chunk size (bytes)
+#define OTA_QUEUE_SIZE          8       // FreeRTOS queue depth
+#define OTA_TASK_STACK_SIZE     4096    // Stack size for OTA worker task
+#define OTA_TASK_PRIORITY       1       // Low priority (below main loop)
+#define OTA_CHUNK_TIMEOUT_MS    30000   // 30-second chunk timeout
+#define OTA_SESSION_TIMEOUT_MS  300000  // 5-minute session timeout
 
 #endif // CONFIG_H
